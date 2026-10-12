@@ -410,6 +410,11 @@ class Guard:
                 return
             self.reason = reason
         print(f"GUARD: {reason}, stopping the server", flush=True)
+        if reason != "asked to stop":       # who was using the memory, for the post-mortem
+            top = subprocess.run(["ps", "-eo", "pid,rss,args", "--sort=-rss"], capture_output=True, text=True).stdout
+            for line in top.splitlines()[1:9]:
+                pid, rss, cmd = (line.split(None, 2) + ["", ""])[:3]
+                print(f"GUARD   {pid:>8} {int(rss or 0) / 1048576:5.1f} GB  {cmd[:110]}", flush=True)
         try:
             os.killpg(self.proc.pid, signal.SIGTERM)
         except ProcessLookupError:
