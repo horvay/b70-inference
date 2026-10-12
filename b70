@@ -456,7 +456,7 @@ class Guard:
                 self.stop(f"another GPU job started on the B70: {o[0]}")
             time.sleep(1)
 
-    def run(self, args, warmup=None):
+    def run(self, args, ready=None):
         t0 = time.time()
 
         def child():
@@ -472,8 +472,8 @@ class Guard:
             signal.signal(s, lambda *_: threading.Thread(target=self.stop, args=("asked to stop",)).start())
         threading.Thread(target=self.watch_kernel, args=(t0,), daemon=True).start()
         threading.Thread(target=self.watch_memory, daemon=True).start()
-        if warmup:
-            threading.Thread(target=warmup, daemon=True).start()
+        if ready:
+            threading.Thread(target=ready, daemon=True).start()
         while True:
             try:
                 rc = self.proc.wait()
@@ -486,6 +486,75 @@ class Guard:
         return 0 if self.reason == "asked to stop" else rc
 
 
+# ------------------------------------------------------------------------------------------- warm-up and port gate
+
+def free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def relay(listen_port, target_port):
+    """Forward every TCP connection on 127.0.0.1:listen_port to target_port, byte for byte (streams, keep-alive and a
+    client hanging up, which cancels its request, all pass through)."""
+    import asyncio
+
+    async def pipe(reader, writer):
+        try:
+            while data := await reader.read(65536):
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except (ConnectionError, OSError):
+                pass
+
+    async def handle(client_r, client_w):
+        try:
+            up_r, up_w = await asyncio.open_connection("127.0.0.1", target_port)
+        except OSError:
+            client_w.close()
+            return
+        await asyncio.gather(pipe(client_r, up_w), pipe(up_r, client_w))
+
+    async def main():
+        server = await asyncio.start_server(handle, "127.0.0.1", listen_port, reuse_address=True)
+        async with server:
+            await server.serve_forever()
+
+    asyncio.run(main())
+
+
+def open_when_warm(a, warm, alive):
+    """Wait for the server on its inner port, send it `warm` (one real request: kernels compile, graphs and caches
+    fill), then open the requested port. Until then the port is closed, so a client never meets a server that is up
+    but still warming (SGLang answered /v1/models seconds late right after its start, and client discovery with a
+    short timeout found no model)."""
+    url = f"http://127.0.0.1:{a.inner_port}"
+    while alive():
+        try:
+            urllib.request.urlopen(f"{url}/v1/models", timeout=5).read()
+            break
+        except OSError:
+            time.sleep(2)
+    else:
+        return
+    t0 = time.time()
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"{url}/v1/chat/completions", json.dumps(warm).encode(),
+                                                      {"Content-Type": "application/json"}), timeout=900).read()
+        say(f"warm-up request done in {time.time() - t0:.0f} s")
+    except OSError as e:
+        say(f"warm-up request failed ({e}); opening the port anyway")
+    if alive():
+        threading.Thread(target=relay, args=(a.port, a.inner_port), daemon=True).start()
+        say(f"ready on http://127.0.0.1:{a.port}/v1")
+
+
 # --------------------------------------------------------------------------------------------------------- serve
 
 def serve_glm(a, model, store):
@@ -494,13 +563,14 @@ def serve_glm(a, model, store):
     ctx = min(a.ctx or 49152, 65536)
     env = {"GLM_XPU_RAM_MARGIN": os.environ.get("GLM_XPU_RAM_MARGIN", "0.2")}
     env.update({k: v for k, v in os.environ.items() if k.startswith(("GLM_XPU_", "GLM_SERVE_"))})
-    cmd = ["python3", "/w/xpu/serve.py", "--host", "127.0.0.1", "--port", str(a.port), "--cache", str(ctx),
+    cmd = ["python3", "/w/xpu/serve.py", "--host", "127.0.0.1", "--port", str(a.inner_port), "--cache", str(ctx),
            "--served-name", a.name or "glm-5.3-flash", "--store", "/nvx/glm53_flash_exl3_experts_blob.bin"]
     if a.ram_gb:
         cmd += ["--ram-gb", str(a.ram_gb)]
     if a.chat_template:
         cmd += ["--chat-template", "/opt/chat_template.jinja"]
-    return sandbox("glm", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template), 40, None
+    return sandbox("glm", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template), 40, \
+        {"model": a.name or "glm-5.3-flash", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
 
 
 def serve_flashnext(a, model, store):
@@ -544,7 +614,7 @@ def serve_flashnext(a, model, store):
         bs *= 2
     graph_bs.append(users)
     cmd = ["python3", "-m", "sglang.launch_server", "--model-path", "/model", "--quantization", "exl3",
-           "--trust-remote-code", "--device", "xpu", "--host", "127.0.0.1", "--port", str(a.port),
+           "--trust-remote-code", "--device", "xpu", "--host", "127.0.0.1", "--port", str(a.inner_port),
            "--served-model-name", a.name or "flashnext-uncensored",
            "--disable-shared-experts-fusion", "--kv-cache-dtype", "fp8_e4m3", "--context-length", str(ctx),
            "--mem-fraction-static", "0.785", "--chunked-prefill-size", "8192", "--max-running-requests", str(users),
@@ -556,30 +626,12 @@ def serve_flashnext(a, model, store):
         cmd += ["--chat-template", "/opt/chat_template.jinja"]
     make_store_dir(store)
 
-    def warmup():
-        # one ~5K-token prompt once the server answers: the first long prompt after a start pays ~2.5 s of one-time
-        # setup, better before a player waits on it
-        url = f"http://127.0.0.1:{a.port}"
-        for _ in range(300):
-            try:
-                urllib.request.urlopen(f"{url}/v1/models", timeout=2).read()
-                break
-            except OSError:
-                time.sleep(3)
-        else:
-            return
-        with open(os.path.join(REPO, "flashnext", "hot", "warmup_prompt.json")) as f:
-            body = json.load(f)
-        body.update(max_tokens=1, model=a.name or "flashnext-uncensored")
-        try:
-            urllib.request.urlopen(urllib.request.Request(f"{url}/v1/chat/completions", json.dumps(body).encode(),
-                                                          {"Content-Type": "application/json"}), timeout=300).read()
-            say("warm-up prompt done")
-        except OSError:
-            pass
-
+    # a ~5K-token prompt: the first long prompt after a start pays ~2.5 s of one-time setup
+    with open(os.path.join(REPO, "flashnext", "hot", "warmup_prompt.json")) as f:
+        warm = json.load(f)
+    warm.update(max_tokens=1, model=a.name or "flashnext-uncensored")
     return (sandbox("flashnext", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template),
-            45 if a.all_ram else 25, warmup)
+            45 if a.all_ram else 25, warm)
 
 
 def cmd_serve(a):
@@ -604,14 +656,15 @@ def cmd_serve(a):
     lock.flush()
     if a.prepare:
         prepare(model, store)
-    args, ram_start, warmup = (serve_glm if fam == "glm" else serve_flashnext)(a, model, store)
+    a.inner_port = free_port()
+    args, ram_start, warm = (serve_glm if fam == "glm" else serve_flashnext)(a, model, store)
     guard = Guard(ram_start)
     guard.check_start()
-    say(f"serving {os.path.basename(model)} ({fam}) on http://127.0.0.1:{a.port}/v1")
+    say(f"loading {os.path.basename(model)} ({fam}); http://127.0.0.1:{a.port}/v1 opens once it is warm")
     if a.dry_run:
         print(shlex.join(args))
         return
-    sys.exit(guard.run(args, warmup))
+    sys.exit(guard.run(args, lambda: open_when_warm(a, warm, lambda: guard.proc.poll() is None and not guard.reason)))
 
 
 def running_server():
