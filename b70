@@ -17,7 +17,8 @@ Families (by config.json model_type), and the install that serves them:
 The sglang install is SGLang 0.5.20-xpu with 0xSero's trellis-serve (EXL3 kernels for Intel) and trellis-serve.patch.
 
 Everything runs inside the unpacked lmsysorg/sglang XPU image through bubblewrap; no Docker, no root. `serve` is also a
-guard: it stops the server at the first xe fault on the B70, when RAM runs low, or when another GPU job opens the B70.
+guard: it stops the server at the first xe fault on the B70, when RAM runs low, or when another GPU job opens the B70,
+and does not start beside a Steam game that has the B70 open.
 
 State lives in B70_STATE (default <repo>/state): the image, per-family overlays, the trellis-serve checkout, caches,
 expert stores, logs. B70_ROOTFS points at an already unpacked image instead; B70_TRELLIS_SRC at a trellis-serve
@@ -411,7 +412,9 @@ class Guard:
         self.ram_floor = float(os.environ.get("B70_RAM_FLOOR_GB", "4"))
         self.psi_max = float(os.environ.get("B70_PSI_MAX", "40"))
         self.ram_start = float(os.environ.get("B70_RAM_START_GB", ram_start_gb))
-        self.jobs = os.environ.get("B70_OTHER_JOBS", r"sd-cli|main\.py --listen|llama-server|ComfyUI")
+        self.jobs = os.environ.get("B70_OTHER_JOBS",
+                                   r"sd-cli|main\.py --listen|llama-server|ComfyUI|fish[-_]speech|fish_b70|fish_clone")
+        self.games = os.environ.get("B70_GAMES", r"steamapps[/\\]common[/\\]")
         self.pci, self.render = b70_pci()
         self.proc = None
         self.reason = None
@@ -426,6 +429,12 @@ class Guard:
         o = other_jobs(self.jobs, self.render, {os.getpid()})
         if o:
             fail(f"GUARD: not starting, another GPU job is using the B70: {o[0]}", 98)
+        # a Steam game under Proton opens every GPU, the B70 too, even when it renders on another card; model loads
+        # beside one failed binding B70 memory (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY / DEVICE_LOST, xe "VM worker
+        # error: -16"). Only checked at the start: a server already running is left alone.
+        o = other_jobs(self.games, self.render, {os.getpid()})
+        if o:
+            fail(f"GUARD: not starting, a game has the B70 open: {o[0]}", 98)
 
     def stop(self, reason):
         with self.lock:
@@ -601,6 +610,13 @@ def serve_glm(a, model, store):
         {"model": a.name or "glm-5.3-flash", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
 
 
+# Gemma 4 31B's KV budget on the B70 (memory fraction 0.85), in bf16 full-attention tokens (10 layers), and what a
+# sliding-window token costs in those units (50 layers; bf16 / fp8). Fitted to the pools measured next to the drafter:
+# 45.8K full + 4K SWA (bf16, one game), 60K + 4K (fp8 window), 44.9K + 8.2K (fp8, four games), 15.6K + 8.2K (bf16)
+GEMMA_KV_UNITS = {True: 74000, False: 104000}      # with / without the drafter
+GEMMA_SWA_UNITS = {False: 7.16, True: 3.58}        # bf16 / fp8 window
+
+
 def serve_gemma(a, model, store):
     """Gemma 4 (dense, EXL3) on the same SGLang + trellis-serve install as Flash-Next."""
     users = max(1, min(a.parallel or 1, 8))
@@ -617,21 +633,32 @@ def serve_gemma(a, model, store):
         "NEOReadDebugKeys": "1", "TreatNonUsmForTransfersAsSharedSystem": "0", "EnableSharedSystemUsmSupport": "0",
         "PYTHONPATH": "/opt/b70/pyhooks", "TRIM_EVERY_S": "300",
     }
-    # packed full-attention KV (kvpack.py): 4-bit, rotated keys, 3.2x the tokens of bf16, decode pays an unpack per
-    # layer; on when the context asked for needs it (bf16 holds ~46K tokens next to the drafter with the SWA pool
-    # sized below, packed ~107K)
+    # the sliding-window pool (50 layers x 16 KV heads x 512, ~820 KB per token in bf16) only needs a prefill chunk
+    # plus the 1024-token window per running request, and one window (plus a page) for each other game's cached
+    # prompt (kvpack.py keeps one window per cached game); it gets that, and the full-attention pool the rest of the
+    # budget (a full:SWA ratio spent most of the memory on the SWA pool)
+    chunk = int(os.environ.get("B70_CHUNK", "2048"))       # 2048 read prompts as fast as 8192 and halves the SWA pool
+    swa_tokens = int(os.environ.get("B70_SWA_TOKENS",
+                                    str(chunk + users * (1024 + 384) + (users - 1) * (1024 + 128) + 512)))
+    env["EXL3_SWA_TOKENS"] = str(swa_tokens)
+    # smaller KV (kvpack.py). The sliding-window layers in fp8 halve their pool and decode as fast as bf16 for one
+    # game, faster for several (1/2/4 games: 42/91/135 tok/s against 43.5/68.5/127); the full-attention layers packed
+    # (4-bit, rotated keys) hold 3.2x the tokens, but attention unpacks each game's whole context every step (four
+    # games at 20K: 19 tok/s each), so they are packed only when the unpacked pool cannot hold every game's context.
+    # One game keeps the exact bf16 window while its context fits.
     memfrac = float(os.environ.get("B70_MEMFRAC", "0.85"))
-    pack = a.kv_pack == "on" or (a.kv_pack == "auto" and ctx > 45000)
-    if pack:
+    units = float(os.environ.get("B70_KV_UNITS", GEMMA_KV_UNITS[bool(a.drafter)]))
+    room = {fp8: units - swa_tokens * GEMMA_SWA_UNITS[fp8] for fp8 in (False, True)}   # full-attention tokens
+    auto_fp8 = users > 1 or ctx > room[False]
+    fp8_window, pack_full = {"off": (False, False), "window": (True, False), "all": (True, True), "on": (True, True),
+                             "auto": (auto_fp8, ctx * users > room[auto_fp8])}[a.kv_pack]
+    if fp8_window:
+        env["EXL3_KV_FP8_SWA"] = "1"
+    if pack_full:
         # one request's unpack scratch: K and V of the 4 KV heads x 512, bf16, per context token
         scratch_gb = ctx * 4 * 512 * 2 * 2 / 2**30
         memfrac -= scratch_gb / 31.9 + 0.01
         env.update({"EXL3_KV_PACK": "1", "EXL3_KV_PACK_CTX": str(ctx)})
-    # the sliding-window pool (50 layers x 16 KV heads x 512, ~820 KB per token) only needs a prefill chunk plus
-    # the 1024-token window per running request; it gets that, and the full-attention pool the rest of the budget
-    # (a full:SWA ratio spent most of the memory on the SWA pool)
-    chunk = int(os.environ.get("B70_CHUNK", "2048"))       # 2048 read prompts as fast as 8192 and halves the SWA pool
-    env["EXL3_SWA_TOKENS"] = os.environ.get("B70_SWA_TOKENS", str(chunk + users * (1024 + 384) + 512))
     env.update({k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "SGLANG_"))})
     bs, graph_bs = 1, []
     while bs < users:
@@ -652,8 +679,8 @@ def serve_gemma(a, model, store):
            # reading a cold mapped page while loading (xe "Engine memory CAT error", class=bcs), with the model's files
            # pushed out of the page cache; vLLM's --safetensors-load-strategy eager fixed the same fault
            "--weight-loader-disable-mmap", "--model-loader-extra-config", '{"enable_multithread_load": false}',
-           # Intel's attention kernel has no fp8 path for Gemma's 512-wide global heads: the cache stays bf16 (or
-           # packed, see --kv-pack)
+           # SGLang's own cache type stays bf16: Intel's attention kernel has no fp8 path for Gemma's 512-wide global
+           # heads; kvpack.py stores the windows in fp8 and the global layers packed (see --kv-pack)
            ]
     if os.environ.get("B70_GRAPHS", "1") == "1":
         cmd += ["--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs)]
@@ -869,8 +896,11 @@ def main():
     p.add_argument("--ram-gb", type=float, help="glm: RAM tier size in GB (default 27)")
     p.add_argument("--chat-template", help="Jinja chat template to serve with instead of the model's own")
     p.add_argument("--drafter", help="gemma: an assistant model folder that drafts tokens (gemma-4-*-assistant)")
-    p.add_argument("--kv-pack", choices=["auto", "on", "off"], default="auto",
-                   help="gemma: packed 4-bit full-attention KV cache (3.2x the context; auto: when --ctx needs it)")
+    p.add_argument("--kv-pack", choices=["auto", "window", "all", "on", "off"], default="auto",
+                   help="gemma: smaller KV cache: `window` keeps the sliding-window layers in fp8, `all` (or `on`) "
+                        "also packs the full-attention layers to 4 bits (3.2x the tokens, decode slows with context); "
+                        "auto: fp8 windows for 2+ games or a context bf16 cannot hold, and all when the unpacked "
+                        "full-attention layers cannot hold --ctx x --parallel")
     p.add_argument("--prepare", action="store_true", help="run `prepare` first when the model needs it (GLM: packs "
                                                           "the NVMe store, ~95 GB, once)")
     p.add_argument("--dry-run", action="store_true", help="print the sandbox command instead of running it")

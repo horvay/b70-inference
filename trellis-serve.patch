@@ -765,17 +765,26 @@ index 0000000..eceb323
 +    return True
 diff --git c/xpu/exl3xpu/kvpack.py i/xpu/exl3xpu/kvpack.py
 new file mode 100644
-index 0000000..91a9184
+index 0000000..45e066c
 --- /dev/null
 +++ i/xpu/exl3xpu/kvpack.py
-@@ -0,0 +1,370 @@
-+"""Packed KV cache for full-attention layers of hybrid sliding-window models (Gemma 4) on the B70: EXL3_KV_PACK=1.
+@@ -0,0 +1,512 @@
++"""Smaller KV caches for hybrid sliding-window models (Gemma 4) on the B70: the full-attention layers packed
++(EXL3_KV_PACK=1), the sliding-window layers in fp8 (EXL3_KV_FP8_SWA=1).
++
++Sliding-window layers. Intel's flash attention reads an fp8 cache for heads up to 256 wide with a per-tensor descale,
++as fast as bf16 for one request and twice as fast for four (Gemma 4 31B with its drafter, 1/2/4 games: 42/91/135
++tok/s against 43.5/68.5/127). Writes saturate at +-448. Teacher-forced as below: same
++top token 97.8%, KL 0.0065 (8-bit integer groups did better, 98.9% / KL 0.0009, but need the unpack described below,
++~10 ms a step for four requests over 50 layers; 4-bit groups lost too much there: 95%, KL 0.02-0.05).
++
++Full-attention layers, packed:
 +
 +Format. Keys are rotated by a fixed random orthogonal matrix R (k -> k @ R.T; the query gets the same rotation, so
 +q.k is unchanged), then keys and values are stored as 4-bit asymmetric groups of 32 elements: per head and token D/2
 +code bytes (byte j holds element j in its low nibble and element j + D/2 in its high one) and an fp16 scale and zero
 +per group, 640 bytes for D = 512 against 2048 in bf16. On Gemma 4 31B's ten full-attention layers this measured,
-+teacher-forced over 1,118 reply tokens against the exact cache: same top token 97.0%, KL 0.005 (TurboQuant's
++teacher-forced over 1,118 reply tokens against the exact cache: same top token 98.0%, KL 0.003 (TurboQuant's
 +Lloyd-Max codebook variant alike, its QJL residual bit clearly worse: KL 0.16 at 3 bits).
 +
 +Attention. Intel's flash attention reads bf16 pages near the card's bandwidth, and Triton decode kernels over the
@@ -783,8 +792,10 @@ index 0000000..91a9184
 +unpacked into one reused bf16 scratch (~450 GB/s) and Intel's kernel runs on that. The cache holds 3.2x the tokens;
 +decode pays the unpack (+0.4 ms per layer at 16K tokens of context, +1.6 ms at 64K).
 +
-+Pieces: PackedKVPool (the SWAKVPool's full-attention half), the pool-size patch (bytes per token), the backend
-+patch (XPUAttentionBackend.forward_extend / forward_decode for packed layers), Triton pack / unpack kernels.
++Pieces: PackedKVPool and Fp8KVPool (the SWAKVPool's two halves), the pool-size patch (bytes per token), the backend
++patch (XPUAttentionBackend.forward_extend / forward_decode for their layers), Triton pack / unpack kernels. Also, for
++any hybrid model (EXL3_SWA_TOKENS=N): a sliding-window pool of N tokens with the rest for the full-attention pool, and
++the radix cache keeping one window per cached game, so several games' prompts stay cached.
 +"""
 +from __future__ import annotations
 +
@@ -803,7 +814,13 @@ index 0000000..91a9184
 +
 +
 +def enabled() -> bool:
++    """Full-attention layers packed."""
 +    return os.environ.get("EXL3_KV_PACK", "0") == "1"
++
++
++def swa_fp8_enabled() -> bool:
++    """Sliding-window layers in fp8 (EXL3_KV_FP8_SWA=1)."""
++    return os.environ.get("EXL3_KV_FP8_SWA", "0") == "1"
 +
 +
 +def rotation(d: int, device, dtype=torch.bfloat16, seed: int = 1) -> torch.Tensor:
@@ -814,6 +831,12 @@ index 0000000..91a9184
 +        q, _ = torch.linalg.qr(torch.randn(d, d, generator=g, dtype=torch.float64))
 +        _rot[key] = q.to(dtype).to(device)
 +    return _rot[key]
++
++
++def _dev(device) -> str:
++    """'xpu' and 'xpu:0' name the same scratch."""
++    d = torch.device(device)
++    return f"{d.type}:{d.index if d.index is not None else torch.xpu.current_device()}"
 +
 +
 +def packed_row_bytes(d: int) -> int:
@@ -973,16 +996,29 @@ index 0000000..91a9184
 +        def load_cpu_copy(self, *a, **k):
 +            raise NotImplementedError("packed KV cache: no host offload")
 +
-+    return PackedKVPool
++    class Fp8KVPool(MHATokenToKVPool):
++        """The sliding-window half in float8_e4m3fn, whatever dtype the server's cache has; writes saturate at
++        +-448 (a plain cast turns anything past it into NaN)."""
++
++        def __init__(self, *a, dtype=None, **kw):
++            self.model_dtype = dtype
++            super().__init__(*a, dtype=torch.float8_e4m3fn, **kw)
++
++        def set_kv_buffer(self, layer, loc, cache_k, cache_v, k_scale=None, v_scale=None, layer_id_override=None,
++                          **kw):
++            super().set_kv_buffer(layer, loc, cache_k.clamp(-448.0, 448.0), cache_v.clamp(-448.0, 448.0), None,
++                                  None, layer_id_override, **kw)
++
++    return PackedKVPool, Fp8KVPool
 +
 +
-+PackedKVPool = None
++PackedKVPool = Fp8KVPool = None
 +
 +
 +# ----------------------------------------------------------------------------------------------------- attention
 +
 +def _scratch_for(device, heads: int, d: int, pages: int, page_size: int, dtype):
-+    key = (str(device), heads, d, page_size, dtype)
++    key = (_dev(device), heads, d, page_size, dtype)
 +    s = _scratch.get(key)
 +    if s is None or s["pages"] < pages:
 +        n = pages * page_size
@@ -1004,13 +1040,15 @@ index 0000000..91a9184
 +    return s
 +
 +
-+def _packed_layer(backend, layer):
++def _own_layer(backend, layer):
++    """(sub-pool, its layer index) for a layer whose KV lives in a PackedKVPool or Fp8KVPool, else None."""
 +    pool = backend.token_to_kv_pool
-+    full = getattr(pool, "full_kv_pool", None)
-+    if PackedKVPool is None or not isinstance(full, PackedKVPool):
-+        return None, None
-+    lid, is_swa = pool.layers_mapping.get(layer.layer_id, (None, True))
-+    return (full, lid) if not is_swa else (None, None)
++    mapping = getattr(pool, "layers_mapping", None)
++    if mapping is None or layer.layer_id not in mapping:
++        return None
++    lid, is_swa = mapping[layer.layer_id]
++    sub = pool.swa_kv_pool if is_swa else pool.full_kv_pool
++    return (sub, lid) if isinstance(sub, tuple(c for c in (PackedKVPool, Fp8KVPool) if c is not None)) else None
 +
 +
 +def _attend(backend, q, k, v, layer, forward_batch, save_kv_cache, pool, lid, flash_attn):
@@ -1060,6 +1098,35 @@ index 0000000..91a9184
 +    return out.view(-1, HQ * DV)
 +
 +
++_ones: dict = {}
++
++
++def _attend_fp8(backend, q, k, v, layer, forward_batch, save_kv_cache, pool, lid, flash_attn):
++    """A sliding-window layer over the fp8 pool: SGLang's own call with the per-tensor descale (1) Intel's kernel
++    needs to read an fp8 cache."""
++    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
++    md = backend.forward_metadata
++    if k is not None and save_kv_cache:
++        backend.token_to_kv_pool.set_kv_buffer(layer, KVWriteLoc(forward_batch.out_cache_loc, md.swa_out_cache_loc),
++                                               k, v, layer.k_scale, layer.v_scale)
++    if getattr(md, "swa_spec_metadata", None) is not None:
++        raise NotImplementedError("fp8 sliding-window KV: tree speculative decoding (topk > 1)")
++    HQ, D, DV, HK = layer.tp_q_head_num, layer.head_dim, layer.v_head_dim, layer.tp_k_head_num
++    ps = backend.page_size
++    pt = md.swa_page_table
++    one = _ones.get(_dev(q.device))
++    if one is None:
++        one = _ones[_dev(q.device)] = torch.ones(1, dtype=torch.float32, device=q.device)
++    ds = one.expand(pt.shape[0], HK)
++    # q is a slice of the fused qkv projection: Intel's kernel needs it contiguous
++    out = flash_attn(q=q.contiguous().view(-1, HQ, D), k_cache=pool.get_key_buffer(lid).view(-1, ps, HK, D),
++                     v_cache=pool.get_value_buffer(lid).view(-1, ps, HK, DV), page_table=pt,
++                     cache_seqlens=md.cache_seqlens_int32, cu_seqlens_q=md.cu_seqlens_q, cu_seqlens_k_new=None,
++                     max_seqlen_q=md.max_seq_len_q, softmax_scale=layer.scaling, causal=True,
++                     window_size=(layer.sliding_window_size, 0), softcap=layer.logit_cap, k_descale=ds, v_descale=ds)
++    return out.reshape(-1, HQ * DV)
++
++
 +def install_swa_tokens() -> bool:
 +    """EXL3_SWA_TOKENS=N: the sliding-window pool of a hybrid model holds N tokens and the full-attention pool gets the
 +    rest of the KV budget, instead of a fixed full:SWA ratio. The SWA pool only needs a prefill chunk plus the window
@@ -1087,41 +1154,113 @@ index 0000000..91a9184
 +
 +    cls.calculate_pool_sizes = calculate_pool_sizes
 +    cls._exl3_swa_tokens = True
++    _install_swa_chunk_demote()
 +    return True
 +
 +
++def _install_swa_chunk_demote() -> None:
++    """Keep one sliding window per cached game, not every chunk's. A long prompt is read in chunks and each chunk is
++    cached as it lands: its window slots become the radix tree's, so the request cannot free them once they fall out
++    of its window, and they stay as the newest evictable SWA. The LRU then evicted every other game's cached window
++    first (a 20K prompt churns ~20K SWA slots through an 8K pool): with two games each turn re-read its whole prompt
++    (18 s instead of 0.8). So after every insert, the request's nodes outside the windows a later match needs go to
++    the LRU's evict end: while prefilling, the window behind the cached end (also locked); when finished, the window
++    behind the prompt's end, where the next turn's match lands (the reply's thinking is not in the next prompt)."""
++    from sglang.srt.mem_cache import unified_radix_cache as urc
++    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
++    cls = urc.UnifiedRadixCache
++    if getattr(cls, "_exl3_chunk_demote", False):
++        return
++    ct = ComponentType.SWA
++
++    def demote(self, leaf, end, keep_from, keep_to):
++        win = getattr(self, "_sliding_window_size", None)
++        lru = getattr(self.tree_core, "lru_lists", {}).get(ct) if win else None
++        if lru is None or leaf is None:
++            return
++        node = leaf if hasattr(leaf, "key") else self.tree_core.node_by_id(leaf)
++        root, referenced = self.tree_core.root_node, lru._is_referenced
++        while node is not None and node is not root:
++            start = end - len(node.key)
++            if not (start < keep_to and end > keep_from):
++                cd = node.component_data[ct]
++                if (cd.value is not None and cd.lock_ref == 0 and node.id in lru.cache
++                        and (referenced is None or not referenced(node))):
++                    lru._remove_node(node)
++                    lru._add_node_after(lru.tail.lru_prev[lru._pt], node)
++            end = start
++            node = node.parent
++
++    orig_insert, orig_unfinished, orig_finished = cls.insert, cls.cache_unfinished_req, cls.cache_finished_req
++
++    def insert(self, params, *a, **kw):
++        r = orig_insert(self, params, *a, **kw)
++        self._exl3_last_insert = (getattr(params, "key", None), r)
++        return r
++
++    def cache_unfinished_req(self, req, chunked=False, **kw):
++        orig_unfinished(self, req, chunked=chunked, **kw)
++        win, end = getattr(self, "_sliding_window_size", None), req.kv.cache_protected_len
++        if win:
++            demote(self, getattr(req, "last_node", None), end, end - win - self.page_size, end)
++
++    def cache_finished_req(self, req, *a, **kw):
++        self._exl3_last_insert = None
++        orig_finished(self, req, *a, **kw)
++        last, self._exl3_last_insert = self._exl3_last_insert, None
++        win = getattr(self, "_sliding_window_size", None)
++        if not win or last is None or last[0] is None or last[1] is None:
++            return
++        key, r = last
++        p = len(req.origin_input_ids) // self.page_size * self.page_size
++        demote(self, getattr(r, "last_device_node", None), len(key), p - win - self.page_size, p)
++
++    cls.insert, cls.cache_unfinished_req, cls.cache_finished_req = insert, cache_unfinished_req, cache_finished_req
++    cls._exl3_chunk_demote = True
++
++
 +def install() -> bool:
-+    """Packed full-attention KV for hybrid sliding-window models (EXL3_KV_PACK=1)."""
-+    global PackedKVPool
++    """Smaller KV for hybrid sliding-window models: full-attention layers packed (EXL3_KV_PACK=1), sliding-window
++    layers in fp8 (EXL3_KV_FP8_SWA=1)."""
++    global PackedKVPool, Fp8KVPool
 +    install_swa_tokens()
-+    if not enabled():
++    full_on, swa_on = enabled(), swa_fp8_enabled()
++    if not (full_on or swa_on):
 +        return False
-+    PackedKVPool = _pool_class()
++    packed_cls, fp8_cls = _pool_class()
++    PackedKVPool = packed_cls if full_on else None
++    Fp8KVPool = fp8_cls if swa_on else None
 +    from sglang.srt.layers.attention import xpu_backend as xb
 +    from sglang.srt.mem_cache import kv_cache_configurator as kcc
 +    from sglang.srt.model_executor import pool_configurator as pc
 +
-+    # pool sizing: the full-attention half costs the packed bytes per token
++    # pool sizing: packed halves cost the packed bytes per token
 +    cfg_cls = pc.HybridSWAPoolConfigurator
 +    orig_cfg_init = cfg_cls.__init__
 +
 +    def cfg_init(self, kvc, *a, **kw):
 +        orig_cfg_init(self, kvc, *a, **kw)
 +        mc = kvc.model_config
-+        heads = mc.get_num_kv_heads(1)
-+        before = self._full_per_token
-+        self._full_per_token = heads * 2 * packed_row_bytes(mc.head_dim)
++        before = self._full_per_token, self._swa_per_token
++        if full_on:
++            self._full_per_token = mc.get_num_kv_heads(1) * 2 * packed_row_bytes(mc.head_dim)
++        if swa_on:
++            self._swa_per_token = mc.get_swa_num_kv_heads(1) * (mc.swa_head_dim + mc.swa_v_head_dim)
 +        self._recompute_cell_size()
-+        logger.info("exl3xpu: packed KV: full-attention bytes per token %d -> %d", before, self._full_per_token)
++        logger.info("exl3xpu: KV bytes per token, full-attention %d -> %d, sliding-window %d -> %d",
++                    before[0], self._full_per_token, before[1], self._swa_per_token)
 +
 +    cfg_cls.__init__ = cfg_init
 +
-+    # the hybrid pool's full-attention half is a PackedKVPool
++    # the hybrid pool's halves: full-attention packed, sliding-window fp8
 +    orig_swa = kcc.SWAKVPool
 +
 +    def swa_pool(*a, **kw):
-+        if kw.get("full_kv_pool_class") is None and kw.get("full_kv_pool_kwargs") is None:
-+            kw["full_kv_pool_class"] = PackedKVPool
++        if kw.get("full_kv_pool_kwargs") is None and kw.get("swa_kv_pool_kwargs") is None:
++            if full_on and kw.get("full_kv_pool_class") is None:
++                kw["full_kv_pool_class"] = PackedKVPool
++            if swa_on and kw.get("swa_kv_pool_class") is None:
++                kw["swa_kv_pool_class"] = Fp8KVPool
 +        return orig_swa(*a, **kw)
 +
 +    kcc.SWAKVPool = swa_pool
@@ -1131,13 +1270,16 @@ index 0000000..91a9184
 +        orig = getattr(xb.XPUAttentionBackend, name)
 +
 +        def wrapped(self, q, k, v, layer, forward_batch, save_kv_cache=True, *a, _orig=orig, **kw):
-+            pool, lid = _packed_layer(self, layer)
-+            if pool is None:
++            hit = _own_layer(self, layer)
++            if hit is None:
 +                return _orig(self, q, k, v, layer, forward_batch, save_kv_cache, *a, **kw)
-+            return _attend(self, q, k, v, layer, forward_batch, save_kv_cache, pool, lid, xb.flash_attn_with_kvcache)
++            pool, lid = hit
++            attend = _attend if isinstance(pool, PackedKVPool or ()) else _attend_fp8
++            return attend(self, q, k, v, layer, forward_batch, save_kv_cache, pool, lid, xb.flash_attn_with_kvcache)
 +
 +        setattr(xb.XPUAttentionBackend, name, wrapped)
-+    logger.info("exl3xpu: packed KV cache for full-attention layers (4-bit, rotated keys)")
++    logger.info("exl3xpu: KV cache: %s", ", ".join(n for n, on in (
++        ("full-attention layers packed (4-bit, rotated keys)", full_on), ("sliding-window layers in fp8", swa_on)) if on))
 +    return True
 diff --git c/xpu/exl3xpu/modtime.py i/xpu/exl3xpu/modtime.py
 index 686fc06..9e2e69e 100644
@@ -2193,7 +2335,7 @@ index 1b832fe..25a5f3d 100644
                  setattr(m, name, fn)
                  patched.append(f"{mod_name.rsplit('.', 1)[-1]}.{name}")
 diff --git c/xpu/exl3xpu/sglang_plugin.py i/xpu/exl3xpu/sglang_plugin.py
-index bcdd003..7ce5946 100644
+index bcdd003..11b0a00 100644
 --- c/xpu/exl3xpu/sglang_plugin.py
 +++ i/xpu/exl3xpu/sglang_plugin.py
 @@ -16,6 +16,7 @@ import logging
@@ -2554,7 +2696,39 @@ index bcdd003..7ce5946 100644
  class _DraftHeadMethod:
      """quant_method of the pruned draft head: EXL3 GEMM over the kept 128-token blocks only, scattered into a
      full-vocab -inf row (the draft's top-1 can only be a kept token; the target verifies with the full head)."""
-@@ -945,6 +1182,245 @@ def install_mem_probe(model: torch.nn.Module, calls: int = 3, thresh_mb: int = 6
+@@ -774,7 +1011,9 @@ def _patch_xpu_attn_routes() -> None:
+        take the kernel's prefill path, which costs 3.0 ms per layer at 16K fp8 keys for 4 queries vs 0.08 ms for one
+        decode query (tests/bench_sgl_verify_attn.py): SGLang's step time grew 3.5 ms per 1K tokens of context. Each
+        verify row becomes its own decode query over the same pages with cache_seqlens = L - (nq - 1 - j), which is
+-       exactly the bottom-right causal mask. Tensor ops only (no host sync), so it is captured into the verify graph.
++       exactly the bottom-right causal mask; a sliding window (W, 0) moves with each row the same way. Tensor ops only
++       (no host sync), so it is captured into the verify graph. Gemma 4's 50 sliding-window layers: 435 -> 199 us
++       per layer for 4 sequences x 3 queries in bf16, 979 -> 106 us over an fp8 cache.
+     2. EXL3_ONEDNN_ATTN=1: long single-sequence prefill chunks over the fp8 paged KV cache run through the oneDNN
+        Graph fused SDPA (exl3xpu_C::exl3_sdpa_len, fp16, one call per KV head over [0, seq_len), bottom-right causal),
+        the path the vLLM recipe uses."""
+@@ -795,9 +1034,11 @@ def _patch_xpu_attn_routes() -> None:
+     state = {"E": None, "n": 0, "v": 0}
+ 
+     def _common_ok(kw):
++        # a sliding window (left, 0) moves with each decode row's own length, so verify rows keep it exactly
++        win = tuple(kw.get("window_size", (-1, -1)))
+         return (kw.get("q") is not None and kw.get("k_cache") is not None and kw.get("page_table") is not None
+                 and kw.get("cache_seqlens") is not None and kw.get("cu_seqlens_q") is not None
+-                and kw.get("causal", False) and tuple(kw.get("window_size", (-1, -1))) == (-1, -1)
++                and kw.get("causal", False) and (win == (-1, -1) or (win[0] >= 0 and win[1] == 0))
+                 and not kw.get("return_softmax_lse", False) and not kw.get("softcap")
+                 and kw.get("sinks") is None and kw.get("k") is None and kw.get("cache_batch_idx") is None
+                 and kw.get("cache_leftpad") is None)
+@@ -826,6 +1067,7 @@ def _patch_xpu_attn_routes() -> None:
+             return orig(**kw2)
+         kc = kw["k_cache"]
+         if not (onednn_route and kc.dtype == torch.float8_e4m3fn and kw["cu_seqlens_q"].numel() == 2
++                and tuple(kw.get("window_size", (-1, -1))) == (-1, -1)
+                 and q.shape[0] >= _ONEDNN_MIN_Q and "out" not in kw and not torch.xpu.is_current_stream_capturing()):
+             return orig(**kw)
+         if state["E"] is None:
+@@ -945,6 +1187,245 @@ def install_mem_probe(model: torch.nn.Module, calls: int = 3, thresh_mb: int = 6
      logger.info("exl3xpu mem probe installed on %d modules", sum(1 for _ in model.named_modules()))
  
  
@@ -2800,7 +2974,7 @@ index bcdd003..7ce5946 100644
  def _patch_mem_probe() -> None:
      if os.environ.get("EXL3_MEM_PROBE", "0") != "1":
          return
-@@ -962,6 +1438,71 @@ def _patch_mem_probe() -> None:
+@@ -962,6 +1443,71 @@ def _patch_mem_probe() -> None:
      mr.ModelRunner.load_model = load_model
  
  
@@ -2872,7 +3046,7 @@ index bcdd003..7ce5946 100644
  def _patch_step_timing() -> None:
      """Debug (EXL3_STEP_TIMING=N): synchronized wall time of every XPU graph replay (by runner class and batch shape)
      and of each speculative decode step (EAGLEWorkerV2.forward_batch_generation, decode batches only); logs means
-@@ -1179,6 +1720,144 @@ def _cuda_compat_shim() -> None:
+@@ -1179,6 +1725,177 @@ def _cuda_compat_shim() -> None:
                  "is_current_stream_capturing} mapped to torch.xpu (XPU-only torch)")
  
  
@@ -2958,66 +3132,99 @@ index bcdd003..7ce5946 100644
 +
 +
 +def _patch_kv_fakequant(cfg_path: str) -> None:
-+    """Study (EXL3_KV_FAKEQUANT=<json>): full-attention layers round K and V through a compressed format before they
-+    are cached, on prompt (extend) forwards: K rotated by a fixed random orthogonal matrix, each coordinate snapped to
-+    a Lloyd-Max codebook for unit vectors (TurboQuant's MSE stage), rescaled by the vector's norm; V asymmetric
-+    per-group quantization. Measures what such a KV cache would do to the model's output, with no new kernels.
-+    json: {"codebook": path, "k_bits": 4 | 3 | 0 (off) | "fp8", "v_bits": 4 | 3 | 2 | 0 | "fp8", "group": 32,
-+    "seed": 1}; "fp8" rounds through float8_e4m3fn as an fp8 KV cache would."""
++    """Study (EXL3_KV_FAKEQUANT=<json>): attention layers round K and V through a compressed format before they are
++    cached, on prompt (extend) forwards, to measure what such a KV cache would do to the model's output with no new
++    kernels. The json is re-read whenever it changes, so one server can score several formats in turn.
++    json: {"layers": "full" (default) | "swa" | "all", "k_bits": 4 | 3 | 8 | 0 (off) | "fp8",
++    "k_mode": "codebook" (default: K rotated by a fixed random orthogonal matrix, each coordinate snapped to a
++    Lloyd-Max codebook for unit vectors, rescaled by the norm: TurboQuant's MSE stage; needs "codebook") | "group"
++    (rotated, then asymmetric groups like V), "v_bits": 8 | 4 | 3 | 2 | 0 | "fp8", "v_rot": rotate V like K first,
++    "group": 32, "seed": 1};
++    "fp8" rounds through float8_e4m3fn as an fp8 KV cache would, "fp8s" saturating at +-448 first."""
 +    from sglang.srt.layers.radix_attention import RadixAttention
-+    cfg = json.load(open(cfg_path))
-+    books = json.load(open(cfg["codebook"]))
-+    kb, vb, gs = cfg.get("k_bits", 4), cfg.get("v_bits", 4), int(cfg.get("group", 32))
-+    state = {}
++    state = {"mtime": None, "cfg": None, "rot": {}}
 +
-+    def tensors(dev, d):
++    def cfg():
++        m = os.stat(cfg_path).st_mtime
++        if m != state["mtime"]:
++            c = json.load(open(cfg_path))
++            c["books"] = json.load(open(c["codebook"])) if c.get("codebook") else {}
++            state.update(mtime=m, cfg=c, rot={})
++            logger.info("exl3xpu: KV fake-quant study: %s", {k: v for k, v in c.items() if k != "books"})
++        return state["cfg"]
++
++    def rot(c, dev, d):
 +        key = (str(dev), d)
-+        if key not in state:
-+            g = torch.Generator().manual_seed(int(cfg.get("seed", 1)))
++        if key not in state["rot"]:
++            g = torch.Generator().manual_seed(int(c.get("seed", 1)))
 +            pi, _ = torch.linalg.qr(torch.randn(d, d, generator=g))
-+            book = books[str(kb)] if kb in (3, 4) else {"centroids": [0.0], "boundaries": [0.0, 0.0]}
-+            state[key] = (pi.to(dev), torch.tensor(book["centroids"], device=dev),
-+                          torch.tensor(book["boundaries"][1:-1], device=dev))
-+        return state[key]
++            state["rot"][key] = pi.to(dev)
++        return state["rot"][key]
 +
-+    def fq_k(x, d):
-+        pi, cent, bound = tensors(x.device, d)
++    def _fp8(x, saturate):
++        m = x.abs().max().item()
++        if m > 448:
++            logger.info("exl3xpu: KV fake-quant study: |x| up to %.0f, past fp8's 448", m)
++        y = x.clamp(-448, 448) if saturate else x
++        return y.to(torch.float8_e4m3fn).to(x.dtype)
++
++    def fq_group(f, bits, gs):
++        g = f.reshape(-1, gs)
++        lo, hi = g.min(-1, keepdim=True).values, g.max(-1, keepdim=True).values
++        sc = ((hi - lo) / (2 ** bits - 1)).clamp(min=1e-10)
++        return (((g - lo) / sc).round() * sc + lo).reshape(f.shape)
++
++    def fq_k(c, x, d):
++        kb = c.get("k_bits", 4)
++        if kb in ("fp8", "fp8s"):
++            return _fp8(x, kb == "fp8s")
++        if not kb:
++            return x
++        pi = rot(c, x.device, d)
 +        f = x.reshape(-1, d).float()
++        if c.get("k_mode", "codebook") == "group":
++            y = fq_group(f @ pi.T, kb, int(c.get("group", 32)))
++            return (y @ pi).to(x.dtype).reshape(x.shape)
++        book = c["books"][str(kb)]
++        cent = torch.tensor(book["centroids"], device=x.device)
++        bound = torch.tensor(book["boundaries"][1:-1], device=x.device)
 +        n = f.norm(dim=-1, keepdim=True)
-+        y = (f / (n + 1e-10)) @ pi.T
-+        y = cent[torch.searchsorted(bound, y.contiguous())]
++        y = cent[torch.searchsorted(bound, ((f / (n + 1e-10)) @ pi.T).contiguous())]
 +        return ((y @ pi) * n).to(x.dtype).reshape(x.shape)
 +
-+    def fq_v(x):
-+        g = x.reshape(-1, gs).float()
-+        lo, hi = g.min(-1, keepdim=True).values, g.max(-1, keepdim=True).values
-+        sc = ((hi - lo) / (2 ** vb - 1)).clamp(min=1e-10)
-+        return (((g - lo) / sc).round() * sc + lo).to(x.dtype).reshape(x.shape)
++    def fq_v(c, x, d):
++        vb = c.get("v_bits", 4)
++        if vb in ("fp8", "fp8s"):
++            return _fp8(x, vb == "fp8s")
++        if not vb:
++            return x
++        if c.get("v_rot"):
++            pi = rot(c, x.device, d)
++            y = fq_group(x.reshape(-1, d).float() @ pi.T, vb, int(c.get("group", 32)))
++            return (y @ pi).to(x.dtype).reshape(x.shape)
++        return fq_group(x.float(), vb, int(c.get("group", 32))).to(x.dtype)
 +
 +    orig = RadixAttention.forward
 +
 +    def forward(self, q, k, v, forward_batch, *a, **kw):
-+        window = getattr(self, "sliding_window_size", None)
-+        if (k is not None and (window is None or window < 0) and forward_batch.forward_mode.is_extend()
-+                and not torch.xpu.is_current_stream_capturing()):
-+            if kb == "fp8":
-+                k = k.to(torch.float8_e4m3fn).to(k.dtype)
-+            elif kb:
-+                k = fq_k(k, self.head_dim)
-+            if vb == "fp8":
-+                v = v.to(torch.float8_e4m3fn).to(v.dtype)
-+            elif vb:
-+                v = fq_v(v)
++        if k is not None and forward_batch.forward_mode.is_extend() and not torch.xpu.is_current_stream_capturing():
++            c = cfg()
++            window = getattr(self, "sliding_window_size", None)
++            sliding = window is not None and window >= 0
++            want = c.get("layers", "full")
++            if want == "all" or (want == "swa") == sliding:
++                k = fq_k(c, k, self.head_dim)
++                v = fq_v(c, v, self.v_head_dim)
 +        return orig(self, q, k, v, forward_batch, *a, **kw)
 +
 +    RadixAttention.forward = forward
-+    logger.info("exl3xpu: KV fake-quant study on full-attention layers: K %s bits, V %s bits", kb, vb)
++    logger.info("exl3xpu: KV fake-quant study from %s", cfg_path)
 +
 +
  def activate() -> None:
      """sglang.srt.plugins entry point."""
      global _done
-@@ -1200,6 +1879,12 @@ def activate() -> None:
+@@ -1200,6 +1917,12 @@ def activate() -> None:
          logger.warning("exl3xpu: could not add 'exl3' to --quantization choices (%s)", e)
      if os.environ.get("EXL3_CUDA_SHIM", "1") == "1":
          _cuda_compat_shim()
@@ -3030,7 +3237,7 @@ index bcdd003..7ce5946 100644
      if os.environ.get("EXL3_QSA_XPU", "1") == "1" and hasattr(torch, "xpu") and torch.xpu.is_available() \
              and not torch.cuda.is_available():
          try:
-@@ -1229,6 +1914,7 @@ def activate() -> None:
+@@ -1229,6 +1952,7 @@ def activate() -> None:
      except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
          logger.info("exl3xpu: vision shim not installed (%s)", e)
      _patch_mtp()
@@ -3038,7 +3245,7 @@ index bcdd003..7ce5946 100644
      _patch_xpu_spec_sampling()
      _patch_xpu_gdn_verify()
      _patch_xpu_mamba_scatter()
-@@ -1237,9 +1923,25 @@ def activate() -> None:
+@@ -1237,9 +1961,25 @@ def activate() -> None:
      _patch_xpu_attn_routes()
      _patch_gdn_replayssm_fold()
      _patch_xpu_graph_warm_replay()
