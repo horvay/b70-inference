@@ -1817,7 +1817,7 @@ index 1b832fe..25a5f3d 100644
                  setattr(m, name, fn)
                  patched.append(f"{mod_name.rsplit('.', 1)[-1]}.{name}")
 diff --git c/xpu/exl3xpu/sglang_plugin.py i/xpu/exl3xpu/sglang_plugin.py
-index bcdd003..58b2c3c 100644
+index bcdd003..a45285f 100644
 --- c/xpu/exl3xpu/sglang_plugin.py
 +++ i/xpu/exl3xpu/sglang_plugin.py
 @@ -16,6 +16,7 @@ import logging
@@ -2496,7 +2496,7 @@ index bcdd003..58b2c3c 100644
  def _patch_step_timing() -> None:
      """Debug (EXL3_STEP_TIMING=N): synchronized wall time of every XPU graph replay (by runner class and batch shape)
      and of each speculative decode step (EAGLEWorkerV2.forward_batch_generation, decode batches only); logs means
-@@ -1179,6 +1720,63 @@ def _cuda_compat_shim() -> None:
+@@ -1179,6 +1720,87 @@ def _cuda_compat_shim() -> None:
                  "is_current_stream_capturing} mapped to torch.xpu (XPU-only torch)")
  
  
@@ -2557,19 +2557,45 @@ index bcdd003..58b2c3c 100644
 +    cls._exl3_swa_view = True
 +
 +
++def _patch_kv_dump(out_dir: str) -> None:
++    """Debug (EXL3_KV_DUMP=<dir>): the first prompt of 1,000+ tokens saves q, k, v of every full-attention layer
++    (no sliding window) as <dir>/L<layer>.pt, for offline KV cache quantization studies."""
++    from sglang.srt.layers.radix_attention import RadixAttention
++    orig = RadixAttention.forward
++    done = set()
++
++    def forward(self, q, k, v, forward_batch, *a, **kw):
++        window = getattr(self, "sliding_window_size", None)
++        if (k is not None and (window is None or window < 0) and self.layer_id not in done
++                and forward_batch.forward_mode.is_extend() and q.shape[0] >= 1000
++                and not torch.xpu.is_current_stream_capturing()):
++            done.add(self.layer_id)
++            os.makedirs(out_dir, exist_ok=True)
++            torch.save({"q": q.detach().to("cpu", torch.float32), "k": k.detach().to("cpu", torch.float32),
++                        "v": v.detach().to("cpu", torch.float32), "scaling": float(self.scaling),
++                        "heads": self.tp_q_head_num, "kv_heads": self.tp_k_head_num, "head_dim": self.head_dim,
++                        "v_head_dim": self.v_head_dim}, os.path.join(out_dir, f"L{self.layer_id}.pt"))
++            logger.info("exl3xpu: KV dump of layer %d (%d tokens)", self.layer_id, q.shape[0])
++        return orig(self, q, k, v, forward_batch, *a, **kw)
++
++    RadixAttention.forward = forward
++
++
  def activate() -> None:
      """sglang.srt.plugins entry point."""
      global _done
-@@ -1200,6 +1798,8 @@ def activate() -> None:
+@@ -1200,6 +1822,10 @@ def activate() -> None:
          logger.warning("exl3xpu: could not add 'exl3' to --quantization choices (%s)", e)
      if os.environ.get("EXL3_CUDA_SHIM", "1") == "1":
          _cuda_compat_shim()
 +    if os.environ.get("EXL3_SWA_VIEW", "1") == "1":
 +        _patch_xpu_swa_view()
++    if os.environ.get("EXL3_KV_DUMP"):
++        _patch_kv_dump(os.environ["EXL3_KV_DUMP"])
      if os.environ.get("EXL3_QSA_XPU", "1") == "1" and hasattr(torch, "xpu") and torch.xpu.is_available() \
              and not torch.cuda.is_available():
          try:
-@@ -1229,6 +1829,7 @@ def activate() -> None:
+@@ -1229,6 +1855,7 @@ def activate() -> None:
      except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
          logger.info("exl3xpu: vision shim not installed (%s)", e)
      _patch_mtp()
@@ -2577,7 +2603,7 @@ index bcdd003..58b2c3c 100644
      _patch_xpu_spec_sampling()
      _patch_xpu_gdn_verify()
      _patch_xpu_mamba_scatter()
-@@ -1237,9 +1838,20 @@ def activate() -> None:
+@@ -1237,9 +1864,20 @@ def activate() -> None:
      _patch_xpu_attn_routes()
      _patch_gdn_replayssm_fold()
      _patch_xpu_graph_warm_replay()

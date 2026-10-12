@@ -617,6 +617,10 @@ def serve_gemma(a, model, store):
            # a request asking for more output than its prompt leaves room for is cut to fit, as llama-server does
            "--allow-auto-truncate",
            "--attention-backend", os.environ.get("B70_ATTENTION", "intel_xpu"),
+           # read each shard into RAM, one at a time, instead of mapping the files: the copy engine faulted the card
+           # reading a cold mapped page while loading (xe "Engine memory CAT error", class=bcs), with the model's files
+           # pushed out of the page cache; vLLM's --safetensors-load-strategy eager fixed the same fault
+           "--weight-loader-disable-mmap", "--model-loader-extra-config", '{"enable_multithread_load": false}',
            # 50 of Gemma 4 31B's 60 layers only see the last 1024 tokens: their pool needs the window plus a prefill
            # chunk per request, so most of the KV memory goes to the 10 full-attention layers (38K tokens instead of
            # 13K at the default 0.8). Intel's attention kernel has no fp8 path for the 512-wide global heads: bf16.
