@@ -1,0 +1,8 @@
+b70-inference is MIT-licensed (see LICENSE). It includes or derives from:
+
+- glm/: see glm/NOTICE (ExLlamaV3, trellis-serve, glm-flash-lite, moetier, flash-linear-attention).
+- flashnext/trellis-serve.patch: changes to trellis-serve (MIT, Copyright (c) 2026 0xSero), which `b70 setup` fetches
+  from github.com/0xSero/trellis-serve and patches; trellis-serve credits ExLlamaV3, the vLLM Marlin kernels
+  (Apache-2.0) and QTIP, see its NOTICE.
+- The software image both models run in is lmsysorg/sglang (Apache-2.0), pulled by digest; nothing of it is
+  redistributed here.

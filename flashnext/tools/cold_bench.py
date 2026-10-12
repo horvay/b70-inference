@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Benchmarks for the cold tier / RAM margin (README "Smaller RAM footprint"). Runs on the host against a live server
-started with EXL3_MOE_ROUTE_CTL=/run/trellis/route_ctl.json (this file is run/route_ctl.json on the host).
+started with EXL3_MOE_ROUTE_CTL=/run/b70/route_ctl.json (state/run/flashnext/route_ctl.json on the host).
 
     cold_bench.py speed <users> <short|long> [max_tokens]   N concurrent streamed requests, each with a unique prompt
     cold_bench.py margins <m1,m2,..> [reps]                 decode speed (1 user, short GM turns) per margin
     cold_bench.py quality <m1,m2,..>                        teacher-forced top-1 / KL of decode routing vs exact
 
-quality: reference replies are generated once (run/quality_ref.json). For each setting the cache is flushed, every
+quality: reference replies are generated once (state/run/flashnext/quality_ref.json). For each setting the cache is flushed, every
 prompt is prefilled with exact routing (so the prompt is cached as in real use), then prompt + reply is scored with the
 decode routing applied to the reply positions (route control "bias_prompts"). "exact" scores the reply with exact
 routing too. KL is over the union of both sides' top-20 tokens (approximate).
@@ -19,10 +19,14 @@ import sys
 import time
 import urllib.request
 
-BASE = "http://127.0.0.1:30250"
-T = os.path.expanduser("~/work/trellis-b70")
-CTL = f"{T}/run/route_ctl.json"
-GM = open(os.path.expanduser("~/work/neverending_quest/src/play/gm_voice.md")).read()
+BASE = os.environ.get("API", "http://127.0.0.1:30250")
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))      # flashnext/
+RUN = os.path.join(os.path.dirname(HERE), "state", "run", "flashnext")  # /run/b70 inside the sandbox
+CTL = f"{RUN}/route_ctl.json"
+# the system prompt of the "short" turns: a game-master prompt of your own (GM_PROMPT=<file>), else a stand-in
+GM = open(os.environ["GM_PROMPT"]).read() if os.environ.get("GM_PROMPT") else (
+    "You are the game master of a text adventure. Narrate what happens in vivid second person, voice the people the "
+    "player meets, keep track of the world, and end each reply where the player can act.")
 ACTIONS = [   # held-out style player turns (not from any campaign)
     "I offer the goblin chieftain a sack of salt in exchange for safe passage through the hills.",
     "I search the shipwreck on the beach for anything useful, starting with the captain's cabin.",
@@ -33,7 +37,7 @@ ACTIONS = [   # held-out style player turns (not from any campaign)
     "I ask the stable boy which road the masked riders took and slip him a copper for his trouble.",
     "I climb onto the roof of the granary to see who is moving through the square after curfew.",
 ]
-LEDGER = json.load(open(f"{T}/run/long_prompt_16k.json"))["messages"][0]["content"]
+LEDGER = json.load(open(f"{HERE}/bench/long_prompt_16k.json"))["messages"][0]["content"]
 LEDGER = LEDGER[:LEDGER.rindex("\n\n")]
 
 
@@ -138,7 +142,7 @@ def _prompt_of(r):
 
 
 def quality(ms):
-    ref_path = f"{T}/run/quality_ref.json"
+    ref_path = f"{RUN}/quality_ref.json"
     if os.path.exists(ref_path):
         refs = json.load(open(ref_path))
     else:

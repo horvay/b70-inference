@@ -85,41 +85,24 @@ when the experts are in VRAM; with a 105 GB model on a 32 GB card it is off by d
 
 ## Running it
 
-**You need:** Linux with the `xe` kernel driver and an Arc Pro B70 (32 GB), ~62 GB RAM, `bwrap` (bubblewrap) and
-`python3` on the host, ~25 GB for the software image, ~105 GB for the model and ~95 GB on a fast NVMe SSD for the
-expert store (a filesystem where O_DIRECT works; on btrfs use a `chattr +C` directory). No Docker and no root:
-everything runs inside an unpacked copy of the `lmsysorg/sglang` XPU image (PyTorch 2.13 XPU, Triton XPU, oneAPI
-2026.0) through bubblewrap with a throw-away overlay.
+From the repo root (see the [top-level README](../README.md) for what the host needs):
 
 ```bash
-# 1. code (exllamav3 comes in as a submodule: horvay/exllamav3, branch b70-xpu)
-git clone --recursive https://github.com/horvay/b70-glm53-flash && cd b70-glm53-flash
-
-# 2. software image + extra Python packages + kernel build (one time, CPU only)
-scripts/setup.sh
-
-# 3. the model (2.51 bpw EXL3, ~105 GB)
+./b70 setup glm                                   # once: the shared image, glm/pylib, the SYCL kernels (CPU only)
 huggingface-cli download MikeRoz/GLM-5.3-Flash-Uncensored-2.51bpw-h6-exl3 --local-dir /path/to/glm53-model
-export GLM53_MODELS=/path/to/glm53-model          # mounted read-only at /models
-export GLM53_NVX=/path/on/nvme/glm53-store        # expert store directory, mounted at /nvx
-
-# 4. pack the routed experts into the NVMe store (one time; reads the model, writes ~95 GB)
-scripts/in_rootfs.sh python3 /w/xpu/pack_store.py pack
-
-# 5. start the dev server (loads the model once; ~1 min) and try it
-RAM_START_GB=40 scripts/dev_restart.sh
-python3 xpu/dev.py xpu/snip/speed.py              # greedy decode speed on a short prompt
-tail -f run/live.log                               # live prompt / decode speed of whatever is running
-python3 xpu/dev.py --quit                          # stop it
+./b70 prepare /path/to/glm53-model                # once: pack the routed experts into the NVMe store (~95 GB written)
+./b70 serve /path/to/glm53-model --port 8053      # OpenAI-compatible server (glm/xpu/serve.py), one request at a time
 ```
 
-`xpu/dev.py` runs a Python snippet inside the live server (`model`, `tok`, `gen` (exllamav3 Generator), `tier`
-are in scope; see `xpu/snip/` for examples). The first prompt after a start is slow (~60 s of one-time kernel
-compiling); after that, see the numbers above. Expect a first decode run right after a start to be slower too: the
+The server takes chat completions (streamed or not; the model's own chat template, tools, thinking as
+`reasoning_content`, `chat_template_kwargs.enable_thinking` and `reasoning_effort`) and raw completions. A chat
+follow-up that repeats the previous prompt reuses its cached pages and recurrent checkpoint. The first prompt after a
+start is slow (~60 s of one-time kernel compiling); expect the first decode right after a start to be slower too: the
 RAM tier fills in the background and the VRAM tier adapts to what the model actually uses.
 
-`scripts/guarded.sh` wraps every GPU run: it stops the run at the first `xe` fault in the kernel log, when RAM runs
-low, or when another GPU job starts on the B70.
+For development, `scripts/dev_restart.sh` starts a persistent dev server and `xpu/dev.py` runs a Python snippet inside
+it (`model`, `tok`, `gen` (exllamav3 Generator), `tier` are in scope; see `xpu/snip/`). `scripts/in_rootfs.sh` runs a
+command in the image with this folder at `/w` (`GLM53_MODELS`, `GLM53_NVX` set the model and store binds).
 
 Settings (environment):
 
@@ -135,7 +118,7 @@ Settings (environment):
 
 - The first prompt after a server start takes ~60 s (one-time JIT compile of the SYCL kernels).
 - Prompts over 8K tokens run in 8K pieces, each fetching the experts again; 12K in one pass runs out of VRAM.
-- Batch size 1, no OpenAI-compatible server yet.
+- Batch size 1: one request at a time.
 - Faults seen while developing (all fixed, see `docs/dev-notes.md`): a failed XPU graph capture leaves PyTorch's
   graph pool recording and later replays fault the GPU, so a capture failure now disables graphs for the session;
   multi-row `topk`/`sort` touched the pinned host allocator during capture.

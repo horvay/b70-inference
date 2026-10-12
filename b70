@@ -4,7 +4,7 @@
     b70 setup [glm|flashnext|all]          one-time, CPU only: unpack the SGLang XPU image, fetch and build the kernels
     b70 info <model dir>                   JSON: which family the model is, whether setup and prepare are done
     b70 prepare <model dir> [--store DIR]  one-time per model: pack the NVMe expert store (GLM; Flash-Next fills its own)
-    b70 serve <model dir> --port N [--ctx N] [--parallel N] [--name NAME] [--store DIR] [--all-ram]
+    b70 serve <model dir> --port N [--ctx N] [--parallel N] [--name NAME] [--store DIR] [--all-ram] [--prepare]
                                            OpenAI-compatible server in the foreground; SIGTERM stops it
     b70 stop                               stop a running `b70 serve`
     b70 status                             JSON: the running server, if any
@@ -297,6 +297,11 @@ def make_store_dir(store):
 
 
 def cmd_prepare(a):
+    prepare(a.model, a.store, a.force)
+
+
+def prepare(model, store, force=False):
+    a = argparse.Namespace(model=model, store=store, force=force)
     fam, _ = read_model(a.model)
     if not fam:
         fail(f"{a.model} is not a model b70 serves")
@@ -311,7 +316,7 @@ def cmd_prepare(a):
         return
     make_store_dir(store)
     say(f"glm: packing the routed experts into {store} (~95 GB, reads the whole model)")
-    run_in("glm", ["python3", "/w/xpu/pack_store.py", "pack"], model=os.path.abspath(a.model), store=store)
+    run_in("glm", ["python3", "-u", "/w/xpu/pack_store.py", "pack"], model=os.path.abspath(a.model), store=store)
 
 
 # ----------------------------------------------------------------------------------------------------- the guard
@@ -597,6 +602,8 @@ def cmd_serve(a):
     lock.truncate()
     json.dump({"pid": os.getpid(), "port": a.port, "model": model, "family": fam}, lock)
     lock.flush()
+    if a.prepare:
+        prepare(model, store)
     args, ram_start, warmup = (serve_glm if fam == "glm" else serve_flashnext)(a, model, store)
     guard = Guard(ram_start)
     guard.check_start()
@@ -671,6 +678,8 @@ def main():
     p.add_argument("--margin", type=float, help="flashnext: decode router margin against RAM experts (default 0.5)")
     p.add_argument("--ram-gb", type=float, help="glm: RAM tier size in GB (default 27)")
     p.add_argument("--chat-template", help="Jinja chat template to serve with instead of the model's own")
+    p.add_argument("--prepare", action="store_true", help="run `prepare` first when the model needs it (GLM: packs "
+                                                          "the NVMe store, ~95 GB, once)")
     p.add_argument("--dry-run", action="store_true", help="print the sandbox command instead of running it")
     p.set_defaults(fn=cmd_serve)
     sub.add_parser("status").set_defaults(fn=cmd_status)
