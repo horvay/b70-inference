@@ -617,6 +617,21 @@ def serve_gemma(a, model, store):
         "NEOReadDebugKeys": "1", "TreatNonUsmForTransfersAsSharedSystem": "0", "EnableSharedSystemUsmSupport": "0",
         "PYTHONPATH": "/opt/b70/pyhooks", "TRIM_EVERY_S": "300",
     }
+    # packed full-attention KV (kvpack.py): 4-bit, rotated keys, 3.2x the tokens of bf16, decode pays an unpack per
+    # layer; on when the context asked for needs it (bf16 holds ~46K tokens next to the drafter with the SWA pool
+    # sized below, packed ~107K)
+    memfrac = float(os.environ.get("B70_MEMFRAC", "0.85"))
+    pack = a.kv_pack == "on" or (a.kv_pack == "auto" and ctx > 45000)
+    if pack:
+        # one request's unpack scratch: K and V of the 4 KV heads x 512, bf16, per context token
+        scratch_gb = ctx * 4 * 512 * 2 * 2 / 2**30
+        memfrac -= scratch_gb / 31.9 + 0.01
+        env.update({"EXL3_KV_PACK": "1", "EXL3_KV_PACK_CTX": str(ctx)})
+    # the sliding-window pool (50 layers x 16 KV heads x 512, ~820 KB per token) only needs a prefill chunk plus
+    # the 1024-token window per running request; it gets that, and the full-attention pool the rest of the budget
+    # (a full:SWA ratio spent most of the memory on the SWA pool)
+    chunk = int(os.environ.get("B70_CHUNK", "2048"))       # 2048 read prompts as fast as 8192 and halves the SWA pool
+    env["EXL3_SWA_TOKENS"] = os.environ.get("B70_SWA_TOKENS", str(chunk + users * (1024 + 384) + 512))
     env.update({k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "SGLANG_"))})
     bs, graph_bs = 1, []
     while bs < users:
@@ -627,8 +642,8 @@ def serve_gemma(a, model, store):
            "--trust-remote-code", "--device", "xpu", "--host", "127.0.0.1", "--port", str(a.inner_port),
            "--served-model-name", a.name or "gemma-4",
            "--kv-cache-dtype", os.environ.get("B70_KV_DTYPE", "auto"), "--context-length", str(ctx),
-           "--mem-fraction-static", os.environ.get("B70_MEMFRAC", "0.85"),
-           "--chunked-prefill-size", os.environ.get("B70_CHUNK", "8192"), "--max-running-requests", str(users),
+           "--mem-fraction-static", f"{memfrac:.3f}",
+           "--chunked-prefill-size", str(chunk), "--max-running-requests", str(users),
            "--dtype", "bfloat16", "--reasoning-parser", "gemma4", "--tool-call-parser", "gemma4",
            # a request asking for more output than its prompt leaves room for is cut to fit, as llama-server does
            "--allow-auto-truncate",
@@ -637,10 +652,9 @@ def serve_gemma(a, model, store):
            # reading a cold mapped page while loading (xe "Engine memory CAT error", class=bcs), with the model's files
            # pushed out of the page cache; vLLM's --safetensors-load-strategy eager fixed the same fault
            "--weight-loader-disable-mmap", "--model-loader-extra-config", '{"enable_multithread_load": false}',
-           # 50 of Gemma 4 31B's 60 layers only see the last 1024 tokens: their pool needs the window plus a prefill
-           # chunk per request, so most of the KV memory goes to the 10 full-attention layers (38K tokens instead of
-           # 13K at the default 0.8). Intel's attention kernel has no fp8 path for the 512-wide global heads: bf16.
-           "--swa-full-tokens-ratio", os.environ.get("B70_SWA_RATIO", "0.2")]
+           # Intel's attention kernel has no fp8 path for Gemma's 512-wide global heads: the cache stays bf16 (or
+           # packed, see --kv-pack)
+           ]
     if os.environ.get("B70_GRAPHS", "1") == "1":
         cmd += ["--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs)]
     else:
@@ -774,7 +788,13 @@ def running_server():
 
 def cmd_run(a):
     """A command inside an install's sandbox, without the GPU (tests, studies); state/run/<install> is /run/b70."""
-    r = subprocess.run(sandbox(a.install, a.command, env={"PYTHONPATH": "/run/b70/py"} if a.install == "sglang" else None))
+    env = {"PYTHONPATH": "/run/b70/py"} if a.install == "sglang" else {}
+    if a.gpu:
+        env["ZE_AFFINITY_MASK"] = "0"
+        guard = Guard(10)
+        guard.check_start()
+        sys.exit(guard.run(sandbox(a.install, a.command, gpu=True, env=env)))
+    r = subprocess.run(sandbox(a.install, a.command, env=env))
     sys.exit(r.returncode)
 
 
@@ -849,11 +869,14 @@ def main():
     p.add_argument("--ram-gb", type=float, help="glm: RAM tier size in GB (default 27)")
     p.add_argument("--chat-template", help="Jinja chat template to serve with instead of the model's own")
     p.add_argument("--drafter", help="gemma: an assistant model folder that drafts tokens (gemma-4-*-assistant)")
+    p.add_argument("--kv-pack", choices=["auto", "on", "off"], default="auto",
+                   help="gemma: packed 4-bit full-attention KV cache (3.2x the context; auto: when --ctx needs it)")
     p.add_argument("--prepare", action="store_true", help="run `prepare` first when the model needs it (GLM: packs "
                                                           "the NVMe store, ~95 GB, once)")
     p.add_argument("--dry-run", action="store_true", help="print the sandbox command instead of running it")
     p.set_defaults(fn=cmd_serve)
     p = sub.add_parser("run", help="run a command in an install's sandbox, without the GPU")
+    p.add_argument("--gpu", action="store_true", help="with the B70, under the guard (kernel tests, benchmarks)")
     p.add_argument("install", choices=["glm", "sglang"])
     p.add_argument("command", nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_run)

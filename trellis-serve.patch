@@ -763,6 +763,382 @@ index 0000000..eceb323
 +    G.mix, G.combine = mix_, combine_
 +    G._exl3_hc = True
 +    return True
+diff --git c/xpu/exl3xpu/kvpack.py i/xpu/exl3xpu/kvpack.py
+new file mode 100644
+index 0000000..91a9184
+--- /dev/null
++++ i/xpu/exl3xpu/kvpack.py
+@@ -0,0 +1,370 @@
++"""Packed KV cache for full-attention layers of hybrid sliding-window models (Gemma 4) on the B70: EXL3_KV_PACK=1.
++
++Format. Keys are rotated by a fixed random orthogonal matrix R (k -> k @ R.T; the query gets the same rotation, so
++q.k is unchanged), then keys and values are stored as 4-bit asymmetric groups of 32 elements: per head and token D/2
++code bytes (byte j holds element j in its low nibble and element j + D/2 in its high one) and an fp16 scale and zero
++per group, 640 bytes for D = 512 against 2048 in bf16. On Gemma 4 31B's ten full-attention layers this measured,
++teacher-forced over 1,118 reply tokens against the exact cache: same top token 97.0%, KL 0.005 (TurboQuant's
++Lloyd-Max codebook variant alike, its QJL residual bit clearly worse: KL 0.16 at 3 bits).
++
++Attention. Intel's flash attention reads bf16 pages near the card's bandwidth, and Triton decode kernels over the
++packed cache ran 17-70x slower, so the packed cache is not read in place: for each layer and request, its pages are
++unpacked into one reused bf16 scratch (~450 GB/s) and Intel's kernel runs on that. The cache holds 3.2x the tokens;
++decode pays the unpack (+0.4 ms per layer at 16K tokens of context, +1.6 ms at 64K).
++
++Pieces: PackedKVPool (the SWAKVPool's full-attention half), the pool-size patch (bytes per token), the backend
++patch (XPUAttentionBackend.forward_extend / forward_decode for packed layers), Triton pack / unpack kernels.
++"""
++from __future__ import annotations
++
++import logging
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++logger = logging.getLogger(__name__)
++
++GS = 32                                   # elements per scale/zero group
++_rot: dict = {}
++_scratch: dict = {}
++
++
++def enabled() -> bool:
++    return os.environ.get("EXL3_KV_PACK", "0") == "1"
++
++
++def rotation(d: int, device, dtype=torch.bfloat16, seed: int = 1) -> torch.Tensor:
++    """R [d, d] orthogonal (fixed seed), on `device`; rows are rotated as x @ R.T."""
++    key = (d, str(device), dtype, seed)
++    if key not in _rot:
++        g = torch.Generator().manual_seed(seed)
++        q, _ = torch.linalg.qr(torch.randn(d, d, generator=g, dtype=torch.float64))
++        _rot[key] = q.to(dtype).to(device)
++    return _rot[key]
++
++
++def packed_row_bytes(d: int) -> int:
++    """Bytes per head and token for K or V."""
++    return d // 2 + 2 * (d // GS) * 2
++
++
++# ------------------------------------------------------------------------------------------------------- kernels
++
++@triton.jit
++def _pack_kernel(x_ptr, loc_ptr, c_ptr, s_ptr, sx_t, sx_h, HK: tl.constexpr, D: tl.constexpr, G: tl.constexpr):
++    t = tl.program_id(0)
++    h = tl.program_id(1)
++    row = tl.load(loc_ptr + t).to(tl.int64)
++    base = x_ptr + t * sx_t + h * sx_h
++    j = tl.arange(0, D // 2)
++    lo = tl.reshape(tl.load(base + j).to(tl.float32), (D // 2 // G, G))
++    hi = tl.reshape(tl.load(base + D // 2 + j).to(tl.float32), (D // 2 // G, G))
++    # groups 0 .. D/2/G-1 cover the low half, the rest the high half; the stored fp16 scale/zero are the ones the
++    # codes are computed against
++    s_lo = tl.maximum((tl.max(lo, axis=1) - tl.min(lo, axis=1)) / 15.0, 1e-8).to(tl.float16)
++    z_lo = tl.min(lo, axis=1).to(tl.float16)
++    s_hi = tl.maximum((tl.max(hi, axis=1) - tl.min(hi, axis=1)) / 15.0, 1e-8).to(tl.float16)
++    z_hi = tl.min(hi, axis=1).to(tl.float16)
++    c_lo = tl.minimum(tl.maximum(tl.floor((lo - z_lo.to(tl.float32)[:, None]) / s_lo.to(tl.float32)[:, None] + 0.5),
++                                 0.0), 15.0).to(tl.uint8)
++    c_hi = tl.minimum(tl.maximum(tl.floor((hi - z_hi.to(tl.float32)[:, None]) / s_hi.to(tl.float32)[:, None] + 0.5),
++                                 0.0), 15.0).to(tl.uint8)
++    byte = tl.reshape(c_lo | (c_hi << 4), (D // 2,))
++    prow = row * HK + h
++    tl.store(c_ptr + prow * (D // 2) + j, byte)
++    g = tl.arange(0, D // 2 // G)
++    sb = s_ptr + prow * (2 * D // G)
++    tl.store(sb + g, s_lo)
++    tl.store(sb + D // 2 // G + g, s_hi)
++    tl.store(sb + D // G + g, z_lo)
++    tl.store(sb + D // G + D // 2 // G + g, z_hi)
++
++
++def pack(x: torch.Tensor, loc: torch.Tensor, codes: torch.Tensor, sz: torch.Tensor) -> None:
++    """x [n, H, D], loc [n] slots -> codes uint8 [N, H, D/2], sz fp16 [N, H, 2*D/GS] (scales then zeros)."""
++    n, H, D = x.shape
++    if n == 0:
++        return
++    if x.stride(-1) != 1:
++        x = x.contiguous()
++    _pack_kernel[(n, H)](x, loc, codes, sz, x.stride(0), x.stride(1), HK=H, D=D, G=GS, num_warps=4)
++
++
++@triton.jit
++def _unpack_kernel(pt_ptr, len_ptr, c_ptr, s_ptr, k_out, PS: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
++                   G: tl.constexpr, RB: tl.constexpr):
++    """program (page i, kv head h, row block b): page pt[i] of the packed cache -> page i of the bf16 scratch, for
++    pages that hold any of the first len tokens."""
++    i = tl.program_id(0)
++    h = tl.program_id(1)
++    b = tl.program_id(2)
++    n = tl.load(len_ptr)
++    if i * PS + b * RB < n:
++        src = tl.load(pt_ptr + i).to(tl.int64)
++        rows = b * RB + tl.arange(0, RB)
++        j = tl.arange(0, D // 2)
++        srow = ((src * PS + rows) * HK + h)[:, None]
++        c = tl.load(c_ptr + srow * (D // 2) + j[None, :])
++        g = j // G
++        sb = s_ptr + srow * (2 * D // G)
++        sl = tl.load(sb + g[None, :]).to(tl.float32)
++        sh = tl.load(sb + D // 2 // G + g[None, :]).to(tl.float32)
++        zl = tl.load(sb + D // G + g[None, :]).to(tl.float32)
++        zh = tl.load(sb + D // G + D // 2 // G + g[None, :]).to(tl.float32)
++        drow = ((i * PS + rows) * HK + h).to(tl.int64)[:, None]
++        tl.store(k_out + drow * D + j[None, :], ((c & 15).to(tl.float32) * sl + zl).to(k_out.dtype.element_ty))
++        tl.store(k_out + drow * D + D // 2 + j[None, :], ((c >> 4).to(tl.float32) * sh + zh).to(k_out.dtype.element_ty))
++
++
++def unpack_pages(page_row: torch.Tensor, length: torch.Tensor, codes: torch.Tensor, sz: torch.Tensor,
++                 out: torch.Tensor, pages: int, page_size: int) -> None:
++    """The first `length` tokens (device scalar) of one request, page ids page_row[:pages], into out pages 0.."""
++    H, D = codes.shape[1], codes.shape[2] * 2
++    rb = 16
++    _unpack_kernel[(pages, H, page_size // rb)](page_row, length, codes, sz, out, PS=page_size, HK=H, D=D, G=GS,
++                                                RB=rb, num_warps=4)
++
++
++def unpack_rows(idx: torch.Tensor, codes: torch.Tensor, sz: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
++    """Rows idx of the packed cache as [m, H, D] (tests)."""
++    H, D = codes.shape[1], codes.shape[2] * 2
++    c = codes[idx.long()].to(torch.int32)
++    s = sz[idx.long()].float()
++    nh = D // 2 // GS
++    lo = (c & 15).float().reshape(-1, H, nh, GS) * s[..., :nh, None] + s[..., D // GS:D // GS + nh, None]
++    hi = (c >> 4).float().reshape(-1, H, nh, GS) * s[..., nh:2 * nh, None] + s[..., D // GS + nh:, None]
++    return torch.cat([lo.reshape(-1, H, D // 2), hi.reshape(-1, H, D // 2)], -1).to(dtype)
++
++
++# ---------------------------------------------------------------------------------------------------------- pool
++
++def _pool_class():
++    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
++
++    class PackedKVPool(MHATokenToKVPool):
++        """Full-attention KV in the packed format; k_buffer / v_buffer are zero-stride bf16 views of the right shape
++        (for callers that only read shapes); the data lives in kc/ks (keys, rotated) and vc/vs (values)."""
++
++        def _create_buffers(self):
++            n = self.size + self.page_size
++            H, D = self.head_num, self.head_dim
++            assert self.v_head_dim == D, "packed KV needs v_head_dim == head_dim"
++            mk = lambda shape, dt: [torch.zeros(shape, dtype=dt, device=self.device) for _ in range(self.layer_num)]
++            self.kc, self.vc = mk((n, H, D // 2), torch.uint8), mk((n, H, D // 2), torch.uint8)
++            self.ks, self.vs = mk((n, H, 2 * D // GS), torch.float16), mk((n, H, 2 * D // GS), torch.float16)
++            fake = torch.zeros(1, dtype=self.dtype, device=self.device)
++            self.k_buffer = [fake.as_strided((n, H, D), (0, 0, 0)) for _ in range(self.layer_num)]
++            self.v_buffer = [fake.as_strided((n, H, D), (0, 0, 0)) for _ in range(self.layer_num)]
++            self.k_scale_buffer = self.v_scale_buffer = self.dq_k_buffer = self.dq_v_buffer = None
++            self.store_dtype = torch.uint8
++            self._kv_buffer_descs = []
++            self.data_ptrs = None
++            # one request's unpack scratch, allocated now: decode graphs are captured with it in place
++            # (the decode page table is as wide as the context length, so the scratch is too)
++            ctx = int(os.environ.get("EXL3_KV_PACK_CTX", "0")) or self.size
++            if self.layer_num:
++                reserve_scratch(self.device, H, D, ctx, self.page_size, self.dtype)
++
++        def _init_data_ptrs_and_strides(self):
++            pass
++
++        def _init_kv_copy_and_warmup(self):
++            self._kv_copy_config = None
++
++        def get_kv_size_bytes(self):
++            per = sum(t.numel() * t.element_size() for t in self.kc + self.ks)
++            return per, sum(t.numel() * t.element_size() for t in self.vc + self.vs)
++
++        def packed(self, layer_id: int):
++            return self.kc[layer_id], self.ks[layer_id], self.vc[layer_id], self.vs[layer_id]
++
++        def set_kv_buffer(self, layer, loc, cache_k, cache_v, k_scale=None, v_scale=None, layer_id_override=None):
++            lid = layer_id_override if layer_id_override is not None else layer.layer_id - self.start_layer
++            H, D = self.head_num, self.head_dim
++            k = cache_k.reshape(-1, H, D)
++            v = cache_v.reshape(-1, H, D)
++            R = rotation(D, k.device, k.dtype)
++            pack((k.reshape(-1, D) @ R.T).view(-1, H, D), loc, self.kc[lid], self.ks[lid])
++            pack(v, loc, self.vc[lid], self.vs[lid])
++
++        def move_kv_cache(self, tgt_loc, src_loc):
++            if tgt_loc.numel() == 0:
++                return
++            for bufs in (self.kc, self.ks, self.vc, self.vs):
++                for t in bufs:
++                    t[tgt_loc] = t[src_loc]
++
++        def get_cpu_copy(self, *a, **k):
++            raise NotImplementedError("packed KV cache: no host offload")
++
++        def load_cpu_copy(self, *a, **k):
++            raise NotImplementedError("packed KV cache: no host offload")
++
++    return PackedKVPool
++
++
++PackedKVPool = None
++
++
++# ----------------------------------------------------------------------------------------------------- attention
++
++def _scratch_for(device, heads: int, d: int, pages: int, page_size: int, dtype):
++    key = (str(device), heads, d, page_size, dtype)
++    s = _scratch.get(key)
++    if s is None or s["pages"] < pages:
++        n = pages * page_size
++        s = {"pages": pages, "k": torch.empty((n, heads, d), dtype=dtype, device=device),
++             "v": torch.empty((n, heads, d), dtype=dtype, device=device),
++             "pt": torch.arange(pages, dtype=torch.int32, device=device)[None, :],
++             "cu": {}}
++        _scratch[key] = s
++        logger.info("exl3xpu: packed KV scratch %d pages (%.2f GB)", pages,
++                    2 * n * heads * d * torch.tensor([], dtype=dtype).element_size() / 2**30)
++    return s
++
++
++def reserve_scratch(device, heads: int, d: int, max_tokens: int, page_size: int, dtype=torch.bfloat16):
++    """Allocate the unpack scratch for `max_tokens` of one request ahead (before graph capture)."""
++    s = _scratch_for(device, heads, d, triton.cdiv(max_tokens, page_size) + 1, page_size, dtype)
++    for nq in range(1, 17):
++        s["cu"][nq] = torch.tensor([0, nq], dtype=torch.int32, device=device)
++    return s
++
++
++def _packed_layer(backend, layer):
++    pool = backend.token_to_kv_pool
++    full = getattr(pool, "full_kv_pool", None)
++    if PackedKVPool is None or not isinstance(full, PackedKVPool):
++        return None, None
++    lid, is_swa = pool.layers_mapping.get(layer.layer_id, (None, True))
++    return (full, lid) if not is_swa else (None, None)
++
++
++def _attend(backend, q, k, v, layer, forward_batch, save_kv_cache, pool, lid, flash_attn):
++    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
++    md = backend.forward_metadata
++    if k is not None and save_kv_cache:
++        backend.token_to_kv_pool.set_kv_buffer(layer, KVWriteLoc(forward_batch.out_cache_loc, md.swa_out_cache_loc),
++                                               k, v, layer.k_scale, layer.v_scale)
++    HQ, D, DV = layer.tp_q_head_num, layer.head_dim, layer.v_head_dim
++    HK = layer.tp_k_head_num
++    qv = q.reshape(-1, HQ, D)
++    R = rotation(D, q.device, q.dtype)
++    q_rot = (qv.reshape(-1, D) @ R.T).view(qv.shape)
++    out = torch.empty((qv.shape[0], HQ, DV), dtype=q.dtype, device=q.device)
++    kc, ks, vc, vs = pool.packed(lid)
++    page_table, seqlens = md.page_table, md.cache_seqlens_int32
++    bs = seqlens.shape[0]
++    ps = backend.page_size
++    mode = forward_batch.forward_mode
++    static = mode.is_decode() or mode.is_target_verify() or torch.xpu.is_current_stream_capturing()
++    if static:
++        nq = qv.shape[0] // bs
++        pages = page_table.shape[1]
++        sc = _scratch_for(q.device, HK, D, pages, ps, q.dtype)
++        cu = sc["cu"].get(nq)
++        if cu is None:
++            cu = sc["cu"][nq] = torch.tensor([0, nq], dtype=torch.int32, device=q.device)
++        spans = [(b * nq, (b + 1) * nq, b, pages) for b in range(bs)]
++    else:
++        cuq = md.cu_seqlens_q.tolist()
++        lens = seqlens.tolist()
++        spans = [(cuq[b], cuq[b + 1], b, triton.cdiv(lens[b], ps)) for b in range(bs)]
++        sc = _scratch_for(q.device, HK, D, max((s[3] for s in spans), default=1), ps, q.dtype)
++    for q0, q1, b, pages in spans:
++        if q1 <= q0:
++            continue
++        unpack_pages(page_table[b], seqlens[b:b + 1], kc, ks, sc["k"], pages, ps)
++        unpack_pages(page_table[b], seqlens[b:b + 1], vc, vs, sc["v"], pages, ps)
++        nq = q1 - q0
++        cu = sc["cu"].get(nq)
++        if cu is None:
++            cu = sc["cu"][nq] = torch.tensor([0, nq], dtype=torch.int32, device=q.device)
++        flash_attn(q=q_rot[q0:q1], k_cache=sc["k"].view(-1, ps, HK, D), v_cache=sc["v"].view(-1, ps, HK, DV),
++                   page_table=sc["pt"][:, :pages], cache_seqlens=seqlens[b:b + 1], cu_seqlens_q=cu,
++                   cu_seqlens_k_new=None, max_seqlen_q=nq, softmax_scale=layer.scaling, causal=True,
++                   window_size=(-1, -1), softcap=layer.logit_cap, out=out[q0:q1])
++    return out.view(-1, HQ * DV)
++
++
++def install_swa_tokens() -> bool:
++    """EXL3_SWA_TOKENS=N: the sliding-window pool of a hybrid model holds N tokens and the full-attention pool gets the
++    rest of the KV budget, instead of a fixed full:SWA ratio. The SWA pool only needs a prefill chunk plus the window
++    per running request (and a little for cached prefixes); at Gemma 4 31B's 820 KB per SWA token against 8 KB
++    (bf16) or 2.5 KB (packed) per full-attention token, the ratio split spent most of the budget on it."""
++    n = int(os.environ.get("EXL3_SWA_TOKENS", "0"))
++    if n <= 0:
++        return False
++    from sglang.srt.model_executor import pool_configurator as pc
++    cls = pc.HybridSWAPoolConfigurator
++    if getattr(cls, "_exl3_swa_tokens", False):
++        return True
++
++    def calculate_pool_sizes(self, available_bytes, page_size):
++        swa_tokens = (n + page_size - 1) // page_size * page_size
++        swa_bytes = swa_tokens * self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
++        full_cell = (self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
++                     + self._swa_per_token * self._draft_swa_full_layers_num)
++        full_tokens = int((available_bytes - swa_bytes) // full_cell) // page_size * page_size
++        if full_tokens <= 0:
++            raise RuntimeError(f"EXL3_SWA_TOKENS={n} leaves no room for the full-attention KV pool")
++        logger.info("exl3xpu: KV pools: %d full-attention tokens, %d sliding-window tokens", full_tokens, swa_tokens)
++        return pc.MemoryPoolConfig(max_total_num_tokens=full_tokens, full_max_total_num_tokens=full_tokens,
++                                   swa_max_total_num_tokens=swa_tokens)
++
++    cls.calculate_pool_sizes = calculate_pool_sizes
++    cls._exl3_swa_tokens = True
++    return True
++
++
++def install() -> bool:
++    """Packed full-attention KV for hybrid sliding-window models (EXL3_KV_PACK=1)."""
++    global PackedKVPool
++    install_swa_tokens()
++    if not enabled():
++        return False
++    PackedKVPool = _pool_class()
++    from sglang.srt.layers.attention import xpu_backend as xb
++    from sglang.srt.mem_cache import kv_cache_configurator as kcc
++    from sglang.srt.model_executor import pool_configurator as pc
++
++    # pool sizing: the full-attention half costs the packed bytes per token
++    cfg_cls = pc.HybridSWAPoolConfigurator
++    orig_cfg_init = cfg_cls.__init__
++
++    def cfg_init(self, kvc, *a, **kw):
++        orig_cfg_init(self, kvc, *a, **kw)
++        mc = kvc.model_config
++        heads = mc.get_num_kv_heads(1)
++        before = self._full_per_token
++        self._full_per_token = heads * 2 * packed_row_bytes(mc.head_dim)
++        self._recompute_cell_size()
++        logger.info("exl3xpu: packed KV: full-attention bytes per token %d -> %d", before, self._full_per_token)
++
++    cfg_cls.__init__ = cfg_init
++
++    # the hybrid pool's full-attention half is a PackedKVPool
++    orig_swa = kcc.SWAKVPool
++
++    def swa_pool(*a, **kw):
++        if kw.get("full_kv_pool_class") is None and kw.get("full_kv_pool_kwargs") is None:
++            kw["full_kv_pool_class"] = PackedKVPool
++        return orig_swa(*a, **kw)
++
++    kcc.SWAKVPool = swa_pool
++
++    # attention for packed layers: unpack per request into the scratch, then Intel's flash attention
++    for name in ("forward_extend", "forward_decode"):
++        orig = getattr(xb.XPUAttentionBackend, name)
++
++        def wrapped(self, q, k, v, layer, forward_batch, save_kv_cache=True, *a, _orig=orig, **kw):
++            pool, lid = _packed_layer(self, layer)
++            if pool is None:
++                return _orig(self, q, k, v, layer, forward_batch, save_kv_cache, *a, **kw)
++            return _attend(self, q, k, v, layer, forward_batch, save_kv_cache, pool, lid, xb.flash_attn_with_kvcache)
++
++        setattr(xb.XPUAttentionBackend, name, wrapped)
++    logger.info("exl3xpu: packed KV cache for full-attention layers (4-bit, rotated keys)")
++    return True
 diff --git c/xpu/exl3xpu/modtime.py i/xpu/exl3xpu/modtime.py
 index 686fc06..9e2e69e 100644
 --- c/xpu/exl3xpu/modtime.py
@@ -1817,7 +2193,7 @@ index 1b832fe..25a5f3d 100644
                  setattr(m, name, fn)
                  patched.append(f"{mod_name.rsplit('.', 1)[-1]}.{name}")
 diff --git c/xpu/exl3xpu/sglang_plugin.py i/xpu/exl3xpu/sglang_plugin.py
-index bcdd003..a45285f 100644
+index bcdd003..7ce5946 100644
 --- c/xpu/exl3xpu/sglang_plugin.py
 +++ i/xpu/exl3xpu/sglang_plugin.py
 @@ -16,6 +16,7 @@ import logging
@@ -2496,7 +2872,7 @@ index bcdd003..a45285f 100644
  def _patch_step_timing() -> None:
      """Debug (EXL3_STEP_TIMING=N): synchronized wall time of every XPU graph replay (by runner class and batch shape)
      and of each speculative decode step (EAGLEWorkerV2.forward_batch_generation, decode batches only); logs means
-@@ -1179,6 +1720,87 @@ def _cuda_compat_shim() -> None:
+@@ -1179,6 +1720,144 @@ def _cuda_compat_shim() -> None:
                  "is_current_stream_capturing} mapped to torch.xpu (XPU-only torch)")
  
  
@@ -2581,10 +2957,67 @@ index bcdd003..a45285f 100644
 +    RadixAttention.forward = forward
 +
 +
++def _patch_kv_fakequant(cfg_path: str) -> None:
++    """Study (EXL3_KV_FAKEQUANT=<json>): full-attention layers round K and V through a compressed format before they
++    are cached, on prompt (extend) forwards: K rotated by a fixed random orthogonal matrix, each coordinate snapped to
++    a Lloyd-Max codebook for unit vectors (TurboQuant's MSE stage), rescaled by the vector's norm; V asymmetric
++    per-group quantization. Measures what such a KV cache would do to the model's output, with no new kernels.
++    json: {"codebook": path, "k_bits": 4 | 3 | 0 (off) | "fp8", "v_bits": 4 | 3 | 2 | 0 | "fp8", "group": 32,
++    "seed": 1}; "fp8" rounds through float8_e4m3fn as an fp8 KV cache would."""
++    from sglang.srt.layers.radix_attention import RadixAttention
++    cfg = json.load(open(cfg_path))
++    books = json.load(open(cfg["codebook"]))
++    kb, vb, gs = cfg.get("k_bits", 4), cfg.get("v_bits", 4), int(cfg.get("group", 32))
++    state = {}
++
++    def tensors(dev, d):
++        key = (str(dev), d)
++        if key not in state:
++            g = torch.Generator().manual_seed(int(cfg.get("seed", 1)))
++            pi, _ = torch.linalg.qr(torch.randn(d, d, generator=g))
++            book = books[str(kb)] if kb in (3, 4) else {"centroids": [0.0], "boundaries": [0.0, 0.0]}
++            state[key] = (pi.to(dev), torch.tensor(book["centroids"], device=dev),
++                          torch.tensor(book["boundaries"][1:-1], device=dev))
++        return state[key]
++
++    def fq_k(x, d):
++        pi, cent, bound = tensors(x.device, d)
++        f = x.reshape(-1, d).float()
++        n = f.norm(dim=-1, keepdim=True)
++        y = (f / (n + 1e-10)) @ pi.T
++        y = cent[torch.searchsorted(bound, y.contiguous())]
++        return ((y @ pi) * n).to(x.dtype).reshape(x.shape)
++
++    def fq_v(x):
++        g = x.reshape(-1, gs).float()
++        lo, hi = g.min(-1, keepdim=True).values, g.max(-1, keepdim=True).values
++        sc = ((hi - lo) / (2 ** vb - 1)).clamp(min=1e-10)
++        return (((g - lo) / sc).round() * sc + lo).to(x.dtype).reshape(x.shape)
++
++    orig = RadixAttention.forward
++
++    def forward(self, q, k, v, forward_batch, *a, **kw):
++        window = getattr(self, "sliding_window_size", None)
++        if (k is not None and (window is None or window < 0) and forward_batch.forward_mode.is_extend()
++                and not torch.xpu.is_current_stream_capturing()):
++            if kb == "fp8":
++                k = k.to(torch.float8_e4m3fn).to(k.dtype)
++            elif kb:
++                k = fq_k(k, self.head_dim)
++            if vb == "fp8":
++                v = v.to(torch.float8_e4m3fn).to(v.dtype)
++            elif vb:
++                v = fq_v(v)
++        return orig(self, q, k, v, forward_batch, *a, **kw)
++
++    RadixAttention.forward = forward
++    logger.info("exl3xpu: KV fake-quant study on full-attention layers: K %s bits, V %s bits", kb, vb)
++
++
  def activate() -> None:
      """sglang.srt.plugins entry point."""
      global _done
-@@ -1200,6 +1822,10 @@ def activate() -> None:
+@@ -1200,6 +1879,12 @@ def activate() -> None:
          logger.warning("exl3xpu: could not add 'exl3' to --quantization choices (%s)", e)
      if os.environ.get("EXL3_CUDA_SHIM", "1") == "1":
          _cuda_compat_shim()
@@ -2592,10 +3025,12 @@ index bcdd003..a45285f 100644
 +        _patch_xpu_swa_view()
 +    if os.environ.get("EXL3_KV_DUMP"):
 +        _patch_kv_dump(os.environ["EXL3_KV_DUMP"])
++    if os.environ.get("EXL3_KV_FAKEQUANT"):
++        _patch_kv_fakequant(os.environ["EXL3_KV_FAKEQUANT"])
      if os.environ.get("EXL3_QSA_XPU", "1") == "1" and hasattr(torch, "xpu") and torch.xpu.is_available() \
              and not torch.cuda.is_available():
          try:
-@@ -1229,6 +1855,7 @@ def activate() -> None:
+@@ -1229,6 +1914,7 @@ def activate() -> None:
      except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
          logger.info("exl3xpu: vision shim not installed (%s)", e)
      _patch_mtp()
@@ -2603,12 +3038,17 @@ index bcdd003..a45285f 100644
      _patch_xpu_spec_sampling()
      _patch_xpu_gdn_verify()
      _patch_xpu_mamba_scatter()
-@@ -1237,9 +1864,20 @@ def activate() -> None:
+@@ -1237,9 +1923,25 @@ def activate() -> None:
      _patch_xpu_attn_routes()
      _patch_gdn_replayssm_fold()
      _patch_xpu_graph_warm_replay()
 +    _patch_route_bias()
 +    from . import fused_xpu
++    try:
++        from . import kvpack
++        kvpack.install()
++    except Exception as e:  # pragma: no cover
++        logger.warning("exl3xpu: packed KV cache not installed (%s)", e)
 +    if fused_xpu.install_hcnorm():
 +        logger.info("exl3xpu: fused hyper-connection RMSNorm on")
 +    if fused_xpu.install_hccombine():
