@@ -9,7 +9,7 @@ at a measured cost in quality.
 |---|---|---|---|---|---|
 | [GLM-5.3-Flash](glm/README.md) 2.51 bpw EXL3 | ~105 GB | ~15-18 tok/s | 8K tokens in 14.4 s | ~30 GB | exllamav3 port (`glm/`) |
 | [Qwen3.8-Flash-Next](flashnext/README.md) 3.05 bpw EXL3 | 68 GB | 41.7 tok/s (68 total for 2 users) | 18K tokens in 15.9 s | ~15 GB | SGLang + trellis-serve + patch |
-| [Gemma 4 31B](gemma/README.md) 4.0 bpw EXL3 (dense) | 17 GB | 36-39 tok/s with its drafter (~107 total for 4) | 12K tokens in 6.5 s | small | SGLang + trellis-serve + patch |
+| [Gemma 4 31B](gemma/README.md) 4.0 bpw EXL3 (dense) | 17 GB | 36-44 tok/s with its drafter (~107 total for 4) | 12K tokens in 6.7 s; context ~46K, ~107K packed | small | SGLang + trellis-serve + patch |
 
 No Docker and no root: both servers run inside an unpacked copy of the `lmsysorg/sglang` XPU image (PyTorch 2.13 XPU,
 Triton XPU, oneAPI 2026.0) through bubblewrap.
