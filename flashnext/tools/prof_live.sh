@@ -11,12 +11,12 @@ curl -s -X POST $API/start_profile -H 'Content-Type: application/json' \
   -d '{"output_dir":"/run/b70/prof","activities":["CPU","XPU"],"with_stack":false,"record_shapes":false,"profile_id":"'$ID'"}' >/dev/null
 s=$(date +%s.%N)
 if [ "$KIND" = prefill ]; then
-    python3 - "$N" "$F/bench/long_prompt_16k.json" <<'PY'
+    python3 - "$N" "$F/bench/long_prompt_16k.json" "$API" <<'PY'
 import json, sys, time, urllib.request
 p = json.load(open(sys.argv[2]))
 p["messages"][0]["content"] = f"Copy {time.time()}\n" + p["messages"][0]["content"]
 p["max_tokens"] = int(sys.argv[1])
-urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:30250/v1/chat/completions", json.dumps(p).encode(),
+urllib.request.urlopen(urllib.request.Request(sys.argv[3] + "/v1/chat/completions", json.dumps(p).encode(),
                        {"Content-Type": "application/json"}), timeout=600).read()
 PY
 else

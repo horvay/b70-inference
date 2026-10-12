@@ -616,13 +616,18 @@ def serve_gemma(a, model, store):
            "--dtype", "bfloat16", "--reasoning-parser", "gemma4", "--tool-call-parser", "gemma4",
            # a request asking for more output than its prompt leaves room for is cut to fit, as llama-server does
            "--allow-auto-truncate",
-           "--attention-backend", os.environ.get("B70_ATTENTION", "intel_xpu")]
+           "--attention-backend", os.environ.get("B70_ATTENTION", "intel_xpu"),
+           # 50 of Gemma 4 31B's 60 layers only see the last 1024 tokens: their pool needs the window plus a prefill
+           # chunk per request, so most of the KV memory goes to the 10 full-attention layers (38K tokens instead of
+           # 13K at the default 0.8). Intel's attention kernel has no fp8 path for the 512-wide global heads: bf16.
+           "--swa-full-tokens-ratio", os.environ.get("B70_SWA_RATIO", "0.2")]
     if os.environ.get("B70_GRAPHS", "1") == "1":
         cmd += ["--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs)]
     else:
         cmd += ["--disable-cuda-graph"]
     if a.chat_template:
         cmd += ["--chat-template", "/opt/chat_template.jinja"]
+    cmd += shlex.split(os.environ.get("B70_SGLANG_ARGS", ""))       # experiments: any other SGLang option
     if a.drafter:
         # Google's assistant model drafts (SGLang runs it as FROZEN_KV_MTP: it reads the target's KV cache and
         # scores only the tokens of its top centroids)
@@ -751,6 +756,22 @@ def cmd_status(_):
     print(json.dumps({"running": running_server()}, indent=1))
 
 
+def sandboxes():
+    """PIDs of bwrap sandboxes over this state's rootfs overlays (a server's lasts a moment past `serve`)."""
+    pids = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == b"bwrap" and os.path.join(STATE, "overlay").encode() in b" ".join(argv):
+            pids.append(int(pid))
+    return pids
+
+
 def cmd_stop(_):
     info = running_server()
     if not info:
@@ -759,11 +780,16 @@ def cmd_stop(_):
     os.kill(info["pid"], signal.SIGTERM)
     for _ in range(150):
         if not running_server():
-            say("stopped")
-            return
+            break
         time.sleep(0.2)
-    os.kill(info["pid"], signal.SIGKILL)
-    say("killed")
+    else:
+        os.kill(info["pid"], signal.SIGKILL)
+    # the overlay stays mounted until the sandbox is gone; a new server could not mount it before
+    for _ in range(100):
+        if not sandboxes():
+            break
+        time.sleep(0.2)
+    say("stopped")
 
 
 def main():
