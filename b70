@@ -316,7 +316,7 @@ def prepare(model, store, force=False):
         fail(f"{fam} is not set up; run `b70 setup {fam}` first")
     store = os.path.abspath(a.store or default_store(fam))
     if fam != "glm":
-        say("flashnext needs no prepare step: the first load writes its NVMe store")
+        say(f"{fam} needs no prepare step" + (": the first load writes its NVMe store" if fam == "flashnext" else ""))
         return
     if glm_store_ready(store) and not a.force:
         say(f"glm: expert store already packed in {store}")
