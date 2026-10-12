@@ -1,14 +1,14 @@
 # exllamav3_ext → XPU porting spec for GLM-5.3-Flash (ext op inventory)
 
-Target: exllamav3 **v1.5.1** (commit `958ec93`, checkout `/home/horvay/work/glm-b70/exllamav3`) running
+Target: exllamav3 **v1.5.1** (commit `958ec93`, checkout `glm/exllamav3`) running
 GLM-5.3-Flash EXL3 (`turboderp/GLM-5.3-Flash-exl3`, rev `332ab457`, 3.05 bpw) on one Intel Arc Pro B70.
 The plan replaces the compiled `exllamav3_ext` module with a Python shim built from torch, Triton and the
 existing XPU kernels. Text-only, single device, no tensor parallel, driven by
-`/home/horvay/work/glm-b70/glm-flash-lite/glm53/serve.py`
+`glm/glm-flash-lite/glm53/serve.py`
 (`-cs 131072 --max-batch-size 8 -chunk_size 8192 -ambs 4`, AsyncGenerator, no `--mtp`/`-dm`/`-ngram`/`-cq`).
 
 Conventions:
-- Paths are relative to `/home/horvay/work/glm-b70/exllamav3`. The Python package is `exllamav3/` and the
+- Paths are relative to `glm/exllamav3`. The Python package is `exllamav3/` and the
   CUDA sources are `exllamav3/exllamav3_ext/`. Most per-part tables drop the `exllamav3/` prefix; each part
   states its base.
 - Line numbers are for v1.5.1.
@@ -356,7 +356,7 @@ Each part keeps its own op table (call sites, conditions, recommended path), per
 
 ## Part A. EXL3 / FP16 linear layers and the quant kernels
 
-Paths are relative to `/home/horvay/work/glm-b70/exllamav3`. Python lives in `exllamav3/`; CUDA in
+Paths are relative to `glm/exllamav3`. Python lives in `exllamav3/`; CUDA in
 `exllamav3/exllamav3_ext/`.
 
 ### 1.0 Checkpoint facts (verified against the HF safetensors headers of rev 332ab457, all 15 shards)
@@ -848,7 +848,7 @@ Env vars in this part:
 
 > **Reconciliation note (see section 3).** This part's phase-1 advice says "don't provide `BC_LinearEXL3`". That is not possible: `LinearEXL3.__init__` constructs `ext.BC_LinearEXL3` unconditionally (`modules/quant/exl3.py:86`), and `LinearEXL3.forward` calls `self.bc.run_alloc`. With a Python `BC_LinearEXL3`, `GatedMLP.load_local` builds `ext.BC_GatedMLP` for the dense MLPs and the shared experts even under `no_reconstruct` (`mlp.py:655-687`; `multi_gu` is None, so `can_separate` holds). The shim therefore provides a small Python `BC_GatedMLP` whose `run_bszN(x, d)` runs gate/up `run_alloc`, `silu_mul(g, u, a, 10)` and `down.run(a, d)`. Everything else in the `no_reconstruct` plan stands: no `BC_BlockSparseMLP`, no `MultiLinear`, no `exl3_mgemm`, and the torch per-expert loop for every MoE batch size. Decode batch is 1–4 under `-ambs 4` (section 1), not 1–8.
 
-Paths are relative to `/home/horvay/work/glm-b70/exllamav3/exllamav3/` unless stated. "ext" means `exllamav3_ext`.
+Paths are relative to `glm/exllamav3/exllamav3/` unless stated. "ext" means `exllamav3_ext`.
 
 ### GLM-5.3-Flash facts that select the paths
 
@@ -1210,7 +1210,7 @@ No `torch.compile`, flash-attn, xformers, pinned memory or explicit streams in `
 
 ## Part C. KDA linear attention (GatedDeltaNet in KDA mode) and recurrent state
 
-Paths are relative to `/home/horvay/work/glm-b70/exllamav3/exllamav3`; C++/CUDA paths are relative to `exllamav3_ext/`.
+Paths are relative to `glm/exllamav3/exllamav3`; C++/CUDA paths are relative to `exllamav3_ext/`.
 
 ### Checkpoint facts (shard-1 safetensors header, rev 332ab457, layer 0)
 
@@ -1512,7 +1512,7 @@ The fp16 Linears (b/f/g) and EXL3 linears (qkv/o) come from Part A.
 
 ## Part D. MLA attention (NoPE), k-pool DSA indexer, KV/indexer caches
 
-All paths are relative to `/home/horvay/work/glm-b70/exllamav3/` (Python package in `exllamav3/`).
+All paths are relative to `glm/exllamav3/` (Python package in `exllamav3/`).
 GLM-5.3-Flash MLA geometry (config): 11 MLA layers (`full_attn_layers` 3,7,...,43), all with
 `indexer_types == "full"` (no "shared" layers). H = 64 heads, q_lora_rank 1536, kv_lora_rank
 D_c = 512, qk_nope_head_dim = 256, **qk_rope_head_dim D_r = 0 (NoPE)**, v_head_dim D_v = 256,
@@ -1843,7 +1843,7 @@ No CUDA graphs, streams, or events are used on the eager MLA path. CUDA graphs o
 
 ## Part E. Hyper-connections, norms, TransformerBlock, model forward / load / warmup, loader, graphs
 
-All paths are relative to `/home/horvay/work/glm-b70/exllamav3`. Python files are under `exllamav3/`, and
+All paths are relative to `glm/exllamav3`. Python files are under `exllamav3/`, and
 CUDA files are under `exllamav3/exllamav3_ext/`. The line numbers are for v1.5.1 (commit 958ec93).
 
 ### (a) Op table for this part
@@ -2217,7 +2217,7 @@ Everything else in this part is unreachable for GLM-5.3-Flash: `hc_head`, `gr_mi
 
 ## Part F. Generator, page table, sampling, cache allocation, recurrent-state machinery
 
-Paths are relative to `/home/horvay/work/glm-b70/exllamav3`. "serve config" means
+Paths are relative to `glm/exllamav3`. "serve config" means
 `glm53/serve.py -cs 131072 --max-batch-size 8 -chunk_size 8192 -ambs 4`, with no `--mtp`, `-dm`, `-ngram`, `-cq`
 or `-ccs`, and the samplers built by `make_sampler` (`ArgmaxSampler()` when temperature <= 0, otherwise
 `ComboSampler(temperature, top_p, top_k, min_p)`). The `GLM53_*` monkeypatches are off by default.

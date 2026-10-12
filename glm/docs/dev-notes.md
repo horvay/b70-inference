@@ -86,7 +86,7 @@ Prefill, later 2026-10-11:
 
 1. Prefill: streaming stager (written, untested), then measure 4K / 16K prompts.
 2. MTP speculative decoding (checkpoint ships `mtp.safetensors`; GLM-5.3 MTP acceptance ~70-75% on real text).
-3. A real OpenAI-compatible server (glm-flash-lite `glm53/serve.py` on this runner) for NQ / OMP.
+3. A real OpenAI-compatible server (glm-flash-lite `glm53/serve.py` on this runner) for chat clients.
 4. Later: sglang Intel `chunk_kda`, the 3080 Ti as an extra expert tier.
 
 ## Hardware facts

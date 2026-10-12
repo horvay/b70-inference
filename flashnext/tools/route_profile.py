@@ -3,8 +3,8 @@
 
     python3 route_profile.py <phase> <system prompt file or -> <out.json> [max_tokens]
 
-Phases A and B are game-master turns: the system prompt is the Neverending Quest Game Master voice prompt and the
-user turns are synthetic player actions (written here, not taken from any campaign). Phases G and H are general use
+Phases A and B are game-master turns: the system prompt is a text-adventure game-master prompt (the file given) and
+the user turns are synthetic player actions (written here, not taken from any campaign). Phases G and H are general use
 (coding, math, explanations, chat, writing, summaries, translation, reasoning) with no system prompt; the ones marked
 think run with thinking on. A and G build hot lists; B and H are held out to evaluate them. Streams each reply, so
 prefill (time to first token) and decode are timed apart. Ends with a tiny request that makes the server write its
