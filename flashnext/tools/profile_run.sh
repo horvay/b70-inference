@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # One server run that profiles expert routing on game-master-style turns (route_profile.py), phase A then the held-out
 # phase B (PHASES="A B G H" adds general-use prompts, G to build and H held out), then stops. Writes
-# state/run/flashnext/route_{A,B}.json (cumulative per-layer routing counts), profile_{A,B}.json (per-request timing)
+# state/run/sglang/route_{A,B}.json (cumulative per-layer routing counts), profile_{A,B}.json (per-request timing)
 # and profile.log. route_to_hot.py turns the counts into hot/RAM lists.
 #   GM_PROMPT=<system prompt file> tools/profile_run.sh <model dir>      (TAG names the outputs; PORT, default 30250)
 set -u
-F=$(dirname "$(dirname "$(readlink -f "$0")")"); B70=$(dirname "$F")/b70; R=$(dirname "$F")/state/run/flashnext
+F=$(dirname "$(dirname "$(readlink -f "$0")")"); B70=$(dirname "$F")/b70; R=$(dirname "$F")/state/run/sglang
 MODEL=$1; PORT=${PORT:-30250}; TAG=${TAG:-}; LOG=$R/profile.log
 mkdir -p "$R"; : > "$LOG"; rm -f "$R/route_profile.json"
 EXL3_MOE_PROFILE=/run/b70/route_profile.json "$B70" serve "$MODEL" --port "$PORT" --all-ram >> "$LOG" 2>&1 &

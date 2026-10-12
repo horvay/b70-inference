@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # prof_live.sh <id> <decode|prefill> [max_tokens]: torch-profiler trace (CPU + XPU kernels) of one request against the
 # running server (started with GRAPHS off to see kernels: EXL3_PROF_SCOPES=1 b70 serve ...); trace in
-# state/run/flashnext/prof/<id>-TP-0.trace.json.gz (tools/prof_cats.py). SGLang maps "GPU" to CUDA, so the
+# state/run/sglang/prof/<id>-TP-0.trace.json.gz (tools/prof_cats.py). SGLang maps "GPU" to CUDA, so the
 # XPU kernel activity must be asked for as "XPU" (the 2026-10-05 traces had driver calls only because of that).
 set -u
-F=$(dirname "$(dirname "$(readlink -f "$0")")"); R=$(dirname "$F")/state/run/flashnext
+F=$(dirname "$(dirname "$(readlink -f "$0")")"); R=$(dirname "$F")/state/run/sglang
 API=${API:-http://127.0.0.1:30250}; ID=$1; KIND=$2; N=${3:-40}
 mkdir -p "$R/prof"; rm -f "$R/prof/$ID"-*
 curl -s -X POST $API/start_profile -H 'Content-Type: application/json' \

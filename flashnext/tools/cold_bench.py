@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Benchmarks for the cold tier / RAM margin (README "Smaller RAM footprint"). Runs on the host against a live server
-started with EXL3_MOE_ROUTE_CTL=/run/b70/route_ctl.json (state/run/flashnext/route_ctl.json on the host).
+started with EXL3_MOE_ROUTE_CTL=/run/b70/route_ctl.json (state/run/sglang/route_ctl.json on the host).
 
     cold_bench.py speed <users> <short|long> [max_tokens]   N concurrent streamed requests, each with a unique prompt
     cold_bench.py margins <m1,m2,..> [reps]                 decode speed (1 user, short GM turns) per margin
     cold_bench.py quality <m1,m2,..>                        teacher-forced top-1 / KL of decode routing vs exact
 
-quality: reference replies are generated once (state/run/flashnext/quality_ref.json). For each setting the cache is flushed, every
+quality: reference replies are generated once (state/run/sglang/quality_ref.json). For each setting the cache is flushed, every
 prompt is prefilled with exact routing (so the prompt is cached as in real use), then prompt + reply is scored with the
 decode routing applied to the reply positions (route control "bias_prompts"). "exact" scores the reply with exact
 routing too. KL is over the union of both sides' top-20 tokens (approximate).
@@ -21,7 +21,7 @@ import urllib.request
 
 BASE = os.environ.get("API", "http://127.0.0.1:30250")
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))      # flashnext/
-RUN = os.path.join(os.path.dirname(HERE), "state", "run", "flashnext")  # /run/b70 inside the sandbox
+RUN = os.path.join(os.path.dirname(HERE), "state", "run", "sglang")  # /run/b70 inside the sandbox
 CTL = f"{RUN}/route_ctl.json"
 # the system prompt of the "short" turns: a game-master prompt of your own (GM_PROMPT=<file>), else a stand-in
 GM = open(os.environ["GM_PROMPT"]).read() if os.environ.get("GM_PROMPT") else (

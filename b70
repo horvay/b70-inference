@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """b70: serve large MoE models on an Intel Arc Pro B70 (32 GB) with a RAM tier and an NVMe expert store.
 
-    b70 setup [glm|flashnext|all]          one-time, CPU only: unpack the SGLang XPU image, fetch and build the kernels
+    b70 setup [glm|sglang|all]             one-time, CPU only: unpack the SGLang XPU image, fetch and build the kernels
     b70 info <model dir>                   JSON: which family the model is, whether setup and prepare are done
     b70 prepare <model dir> [--store DIR]  one-time per model: pack the NVMe expert store (GLM; Flash-Next fills its own)
     b70 serve <model dir> --port N [--ctx N] [--parallel N] [--name NAME] [--store DIR] [--all-ram] [--prepare]
@@ -9,9 +9,11 @@
     b70 stop                               stop a running `b70 serve`
     b70 status                             JSON: the running server, if any
 
-Families (by config.json model_type):
+Families (by config.json model_type), and the install that serves them:
+  gemma      Gemma 4 EXL3 (gemma4): sglang, drafting with Google's assistant model (--drafter)
+  flashnext  Qwen3.8-Flash-Next EXL3 (qwen4_exp): sglang, experts in VRAM, RAM and an NVMe store
   glm        GLM-5.3-Flash EXL3 (glm5_next): glm/ (exllamav3 fork + B70 tier), one request at a time
-  flashnext  Qwen3.8-Flash-Next EXL3 (qwen4_exp): trellis-serve (SGLang 0.5.20-xpu + exl3xpu) with flashnext/'s patch
+The sglang install is SGLang 0.5.20-xpu with 0xSero's trellis-serve (EXL3 kernels for Intel) and trellis-serve.patch.
 
 Everything runs inside the unpacked lmsysorg/sglang XPU image through bubblewrap; no Docker, no root. `serve` is also a
 guard: it stops the server at the first xe fault on the B70, when RAM runs low, or when another GPU job opens the B70.
@@ -43,9 +45,10 @@ IMAGE_CONFIG = os.path.join(REPO, "common", "image-config.json")
 IMAGE = ("registry-1.docker.io", "lmsysorg/sglang",
          "sha256:e4e10d66de374e6e8cc88136e8dbfc3182787070df8a48e581fb007cc7a51c36")
 TRELLIS_REPO = "https://github.com/0xSero/trellis-serve.git"
-TRELLIS_COMMIT = "72fd2d4ca8e8de3fce03ab09e3ed1692957c2f8c"     # branch ft-xpu-vision; flashnext/trellis-serve.patch applies here
+TRELLIS_COMMIT = "72fd2d4ca8e8de3fce03ab09e3ed1692957c2f8c"     # branch ft-xpu-vision; trellis-serve.patch applies here
 TRELLIS = os.path.abspath(os.environ.get("B70_TRELLIS_SRC") or os.path.join(STATE, "trellis-serve"))
-FAMILIES = {"glm5_next": "glm", "qwen4_exp": "flashnext"}
+FAMILIES = {"glm5_next": "glm", "qwen4_exp": "flashnext", "gemma4": "gemma"}
+INSTALL = {"glm": "glm", "flashnext": "sglang", "gemma": "sglang"}     # one SGLang + trellis-serve install
 SERVE_LOCK = os.path.join(STATE, "serve.lock")
 
 
@@ -82,7 +85,7 @@ def glm_store_ready(store):
 
 
 def patch_sha():
-    with open(os.path.join(REPO, "flashnext", "trellis-serve.patch"), "rb") as f:
+    with open(os.path.join(REPO, "trellis-serve.patch"), "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()[:16]
 
 
@@ -109,6 +112,7 @@ def file_sha(path):
 
 
 def setup_done(family):
+    family = INSTALL.get(family, family)
     try:
         with open(setup_marker(family)) as f:
             return json.load(f) == setup_wanted(family) and image_ready()
@@ -129,11 +133,12 @@ def image_env():
     return env
 
 
-def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None, template=None):
+def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None, template=None, drafter=None):
+    family = INSTALL.get(family, family)
     """The bwrap command line that runs `cmd` in the image for `family`.
 
     glm: the rootfs under a throw-away overlay, glm/ at /w (its build output, pylib, run/ and cache/ live there).
-    flashnext: the rootfs under a persistent overlay (state/overlay/flashnext: the editable trellis-serve install and
+    sglang: the rootfs under a persistent overlay (state/overlay/sglang: the editable trellis-serve install and
     oneDNN wheels setup puts there), trellis-serve at /opt/trellis-serve, flashnext/ read-only at /opt/b70."""
     env = dict(env or {})
     img = image_env()
@@ -167,6 +172,8 @@ def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None
         args += ["--bind", store, "/nvx"]
     if template:
         args += ["--ro-bind", template, "/opt/chat_template.jinja"]
+    if drafter:
+        args += ["--ro-bind", drafter, "/drafter"]
     args += ["--setenv", "HOME", "/root"]
     try:
         tz = open("/etc/localtime", "rb").read().splitlines()[-1].decode()
@@ -216,7 +223,7 @@ def fetch_trellis():
         if not os.path.isdir(os.path.join(TRELLIS, "xpu")):
             fail(f"B70_TRELLIS_SRC={TRELLIS} is not a trellis-serve checkout")
         return
-    patch = os.path.join(REPO, "flashnext", "trellis-serve.patch")
+    patch = os.path.join(REPO, "trellis-serve.patch")
     mark = os.path.join(TRELLIS, ".b70-patch")
     want = f"{TRELLIS_COMMIT}+{patch_sha()}"
     if open(mark).read().strip() == want if os.path.exists(mark) else False:
@@ -226,7 +233,7 @@ def fetch_trellis():
         os.makedirs(TRELLIS, exist_ok=True)
         git("init", "-q")
         git("remote", "add", "origin", TRELLIS_REPO)
-    say(f"flashnext: fetching trellis-serve {TRELLIS_COMMIT[:12]}")
+    say(f"sglang: fetching trellis-serve {TRELLIS_COMMIT[:12]}")
     git("fetch", "-q", "--depth", "1", "origin", TRELLIS_COMMIT)
     git("checkout", "-q", "-f", TRELLIS_COMMIT)
     git("clean", "-q", "-fdx")
@@ -235,7 +242,7 @@ def fetch_trellis():
         f.write(want + "\n")
 
 
-FLASHNEXT_BUILD = r"""
+SGLANG_BUILD = r"""
 X=/opt/trellis-serve/xpu/exl3xpu
 python3 -c "import sys, torch, sglang; print(sys.version.split()[0], 'torch', torch.__version__, 'sglang', sglang.__version__)"
 pip install -q --no-deps onednn==2026.0.0 onednn-devel==2026.0.0
@@ -252,20 +259,20 @@ assert any(x.name == 'exl3xpu' for x in e(group='sglang.srt.plugins')); print('e
 """
 
 
-def setup_flashnext():
+def setup_sglang():
     fetch_trellis()
-    say("flashnext: building trellis-serve's kernels and installing the plugin (a few minutes)")
-    run_in("flashnext", ["bash", "-euo", "pipefail", "-c", FLASHNEXT_BUILD])
+    say("sglang: building trellis-serve's kernels and installing the plugin (a few minutes)")
+    run_in("sglang", ["bash", "-euo", "pipefail", "-c", SGLANG_BUILD])
 
 
 def cmd_setup(a):
-    fams = ["glm", "flashnext"] if a.family == "all" else [a.family]
+    fams = ["glm", "sglang"] if a.family == "all" else [a.family]
     setup_image()
     for fam in fams:
         if setup_done(fam) and not a.force:
             say(f"{fam}: already set up")
             continue
-        (setup_glm if fam == "glm" else setup_flashnext)()
+        (setup_glm if fam == "glm" else setup_sglang)()
         with open(setup_marker(fam), "w") as f:
             json.dump(setup_wanted(fam), f)
         say(f"{fam}: setup done")
@@ -578,6 +585,56 @@ def serve_glm(a, model, store):
         {"model": a.name or "glm-5.3-flash", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
 
 
+def serve_gemma(a, model, store):
+    """Gemma 4 (dense, EXL3) on the same SGLang + trellis-serve install as Flash-Next."""
+    users = max(1, min(a.parallel or 1, 8))
+    ctx = a.ctx or 32768
+    env = {
+        "HF_HUB_OFFLINE": "1", "ZE_AFFINITY_MASK": "0",
+        "EXL3_MODEL_PATH": "/model",
+        "EXL3_LIB": "/opt/trellis-serve/xpu/exl3xpu/_C_sgl.so",
+        "EXL3_MOE_LIB": "/opt/trellis-serve/xpu/exl3xpu/_moe_sgl.so",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        # host copies through staging buffers: the copy engine reading a swapped page in place faulted the card
+        # while loading (after 0xSero's omarchy-local-ai 6.8.2/6.8.3)
+        "NEOReadDebugKeys": "1", "TreatNonUsmForTransfersAsSharedSystem": "0", "EnableSharedSystemUsmSupport": "0",
+        "PYTHONPATH": "/opt/b70/pyhooks", "TRIM_EVERY_S": "300",
+    }
+    env.update({k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "SGLANG_"))})
+    bs, graph_bs = 1, []
+    while bs < users:
+        graph_bs.append(bs)
+        bs *= 2
+    graph_bs.append(users)
+    cmd = ["python3", "-m", "sglang.launch_server", "--model-path", "/model", "--quantization", "exl3",
+           "--trust-remote-code", "--device", "xpu", "--host", "127.0.0.1", "--port", str(a.inner_port),
+           "--served-model-name", a.name or "gemma-4",
+           "--kv-cache-dtype", os.environ.get("B70_KV_DTYPE", "auto"), "--context-length", str(ctx),
+           "--mem-fraction-static", os.environ.get("B70_MEMFRAC", "0.85"),
+           "--chunked-prefill-size", os.environ.get("B70_CHUNK", "8192"), "--max-running-requests", str(users),
+           "--dtype", "bfloat16", "--reasoning-parser", "gemma4", "--tool-call-parser", "gemma4",
+           # a request asking for more output than its prompt leaves room for is cut to fit, as llama-server does
+           "--allow-auto-truncate",
+           "--attention-backend", os.environ.get("B70_ATTENTION", "intel_xpu")]
+    if os.environ.get("B70_GRAPHS", "1") == "1":
+        cmd += ["--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs)]
+    else:
+        cmd += ["--disable-cuda-graph"]
+    if a.chat_template:
+        cmd += ["--chat-template", "/opt/chat_template.jinja"]
+    if a.drafter:
+        # Google's assistant model drafts (SGLang runs it as FROZEN_KV_MTP: it reads the target's KV cache and
+        # scores only the tokens of its top centroids)
+        steps = int(os.environ.get("B70_DRAFT_TOKENS", "2"))
+        cmd += ["--speculative-algorithm", "NEXTN", "--speculative-draft-model-path", "/drafter",
+                "--speculative-num-steps", str(steps), "--speculative-eagle-topk", "1",
+                "--speculative-num-draft-tokens", str(steps + 1)]
+    warm = {"model": a.name or "gemma-4", "messages": [{"role": "user", "content": "Hello."}], "max_tokens": 1}
+    return (sandbox("gemma", cmd, gpu=True, model=model, env=env, template=a.chat_template, drafter=a.drafter),
+            25, warm)
+
+
 def serve_flashnext(a, model, store):
     users = max(1, min(a.parallel or 1, 8))
     ctx = min(a.ctx or 204800, 217088)
@@ -624,6 +681,7 @@ def serve_flashnext(a, model, store):
            "--disable-shared-experts-fusion", "--kv-cache-dtype", "fp8_e4m3", "--context-length", str(ctx),
            "--mem-fraction-static", "0.785", "--chunked-prefill-size", "8192", "--max-running-requests", str(users),
            "--dtype", "bfloat16", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder",
+           "--allow-auto-truncate",
            "--linear-attn-prefill-backend", "intel_xpu", "--linear-attn-decode-backend", "intel_xpu",
            "--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs),
            "--max-mamba-cache-size", "12", "--mamba-max-states-per-path", "2", "--max-total-tokens", "217088"]
@@ -649,6 +707,8 @@ def cmd_serve(a):
     store = os.path.abspath(a.store or default_store(fam))
     if a.chat_template:
         a.chat_template = os.path.abspath(a.chat_template)
+    if a.drafter:
+        a.drafter = os.path.realpath(a.drafter)
     os.makedirs(STATE, exist_ok=True)
     lock = open(SERVE_LOCK, "a+")
     try:
@@ -662,7 +722,7 @@ def cmd_serve(a):
     if a.prepare:
         prepare(model, store)
     a.inner_port = free_port()
-    args, ram_start, warm = (serve_glm if fam == "glm" else serve_flashnext)(a, model, store)
+    args, ram_start, warm = {"glm": serve_glm, "flashnext": serve_flashnext, "gemma": serve_gemma}[fam](a, model, store)
     guard = Guard(ram_start)
     guard.check_start()
     say(f"loading {os.path.basename(model)} ({fam}); http://127.0.0.1:{a.port}/v1 opens once it is warm")
@@ -710,7 +770,7 @@ def main():
     ap = argparse.ArgumentParser(prog="b70", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("setup")
-    p.add_argument("family", nargs="?", default="all", choices=["all", "glm", "flashnext"])
+    p.add_argument("family", nargs="?", default="all", choices=["all", "glm", "sglang"])
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_setup)
     p = sub.add_parser("info")
@@ -726,7 +786,7 @@ def main():
     p.add_argument("model")
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--ctx", type=int, help="context length in tokens")
-    p.add_argument("--parallel", type=int, help="requests at once (flashnext; GLM serves one)")
+    p.add_argument("--parallel", type=int, help="requests at once (Gemma and Flash-Next up to 8; GLM serves one)")
     p.add_argument("--name", help="model name the API answers to")
     p.add_argument("--store", help="NVMe expert store directory")
     p.add_argument("--all-ram", action="store_true", help="flashnext: every non-VRAM expert in RAM (~33 GB) instead "
@@ -736,6 +796,7 @@ def main():
     p.add_argument("--margin", type=float, help="flashnext: decode router margin against RAM experts (default 0.5)")
     p.add_argument("--ram-gb", type=float, help="glm: RAM tier size in GB (default 27)")
     p.add_argument("--chat-template", help="Jinja chat template to serve with instead of the model's own")
+    p.add_argument("--drafter", help="gemma: an assistant model folder that drafts tokens (gemma-4-*-assistant)")
     p.add_argument("--prepare", action="store_true", help="run `prepare` first when the model needs it (GLM: packs "
                                                           "the NVMe store, ~95 GB, once)")
     p.add_argument("--dry-run", action="store_true", help="print the sandbox command instead of running it")

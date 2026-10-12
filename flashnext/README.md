@@ -3,7 +3,7 @@
 [Lygodactylus/Qwen3.8-Flash-Next-Uncensored-exl3-3bpw](https://huggingface.co/Lygodactylus/Qwen3.8-Flash-Next-Uncensored-exl3-3bpw)
 (3.05 bpw, 68 GB) served by 0xSero's [trellis-serve](https://github.com/0xSero/trellis-serve/tree/ft-xpu-vision/xpu)
 (SGLang 0.5.20-xpu + the exl3xpu plugin and its SYCL kernels), with `trellis-serve.patch` on top of `ft-xpu-vision`
-@ 72fd2d4. `b70 setup flashnext` fetches that commit and applies the patch; `b70 serve <model dir> --port N` runs it.
+@ 72fd2d4. `b70 setup sglang` fetches that commit and applies the patch (shared with Gemma); `b70 serve <model dir> --port N` runs it.
 
 | | |
 |---|---|
@@ -70,7 +70,7 @@ kernel work below; VRAM already covers ~94% of decode routings, so the margin bu
 ## Running it
 
 ```sh
-b70 setup flashnext                          # once: image, kernels, plugin (CPU only)
+b70 setup sglang                             # once: image, kernels, plugin (CPU only)
 b70 serve /path/to/Qwen3.8-Flash-Next-Uncensored-exl3-3bpw --port 30250 --parallel 4
 ```
 
@@ -82,7 +82,7 @@ O_DIRECT works, on btrfs a `chattr +C` directory).
 Options: `--ctx` (204800, at most 217088), `--parallel` (1-8), `--all-ram`, `--ram-list`/`--hot` (lists in `hot/`;
 `general-*` ones are built from general prompts instead of game-master turns), `--margin`. `EXL3_*` and `SGLANG_*`
 variables pass through; `EXL3_MOE_ROUTE_CTL=/run/b70/route_ctl.json` re-reads `margin`, `bias_prompts` and
-`cold_all_min` from `state/run/flashnext/route_ctl.json` while the server runs.
+`cold_all_min` from `state/run/sglang/route_ctl.json` while the server runs.
 
 ## Tools
 

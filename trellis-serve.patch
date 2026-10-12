@@ -1817,7 +1817,7 @@ index 1b832fe..25a5f3d 100644
                  setattr(m, name, fn)
                  patched.append(f"{mod_name.rsplit('.', 1)[-1]}.{name}")
 diff --git c/xpu/exl3xpu/sglang_plugin.py i/xpu/exl3xpu/sglang_plugin.py
-index bcdd003..1b4557d 100644
+index bcdd003..6656b05 100644
 --- c/xpu/exl3xpu/sglang_plugin.py
 +++ i/xpu/exl3xpu/sglang_plugin.py
 @@ -16,6 +16,7 @@ import logging
@@ -1999,7 +1999,17 @@ index bcdd003..1b4557d 100644
  def _build_classes():
      from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig
      from sglang.srt.utils.common import set_weight_attrs
-@@ -375,7 +506,10 @@ def _build_classes():
+@@ -250,6 +381,9 @@ def _build_classes():
+             if not isinstance(layer, LinearBase):
+                 return None
+             infos = [self.lookup(p, draft) for p in self._sources(prefix)]
++            if prefix.endswith("qkv_proj") and len(infos) == 3 and infos[2] is None and infos[1] is not None:
++                # Gemma 4 attention_k_eq_v layers store no v_proj; SGLang loads k_proj into the V shard too
++                infos[2] = infos[1]
+             if not any(infos):
+                 return UnquantizedLinearMethod()
+             if not all(infos):
+@@ -375,7 +509,10 @@ def _build_classes():
              self.method.process_weights_after_loading(self)
  
          def forward(self, x):
@@ -2011,7 +2021,7 @@ index bcdd003..1b4557d 100644
  
  
      from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-@@ -449,9 +583,14 @@ def _build_classes():
+@@ -449,9 +586,14 @@ def _build_classes():
                  raise NotImplementedError(f"exl3xpu: {self.prefix}: mixed K inside expert {e}")
              store = _moe_store(layer.exl3_hidden, layer.exl3_inter, K, layer.exl3_num_experts)
              if self.key not in store.host:
@@ -2029,7 +2039,7 @@ index bcdd003..1b4557d 100644
              layer.exl3_K = K
              layer.exl3_packed = getattr(layer, "exl3_packed", 0) + 1
              del layer.exl3_store[e]
-@@ -480,13 +619,35 @@ def _build_classes():
+@@ -480,13 +622,35 @@ def _build_classes():
              hot = _moe_hot().get(self.key, [])
              per = int(os.environ.get("EXL3_MOE_RESIDENT_PER_LAYER", "0"))
              want = list(dict.fromkeys(list(hot) + list(range(n))))[:max(per, len(hot))] if (per or hot) else []
@@ -2068,7 +2078,7 @@ index bcdd003..1b4557d 100644
  
          def apply(self, layer, dispatch_output):
              from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-@@ -501,7 +662,25 @@ def _build_classes():
+@@ -501,7 +665,25 @@ def _build_classes():
              else:
                  store.prefill_reset()
                  fwd = store.forward_cached if _MOE_CACHE else store.forward
@@ -2095,7 +2105,7 @@ index bcdd003..1b4557d 100644
              return StandardCombineInput(hidden_states=y.view_as(x))
  
          def get_triton_quant_info(self, layer):
-@@ -599,6 +778,58 @@ def _patch_mtp() -> None:
+@@ -599,6 +781,58 @@ def _patch_mtp() -> None:
      cls.set_lm_head_from_target = set_lm_head_from_target
  
  
@@ -2154,7 +2164,7 @@ index bcdd003..1b4557d 100644
  class _DraftHeadMethod:
      """quant_method of the pruned draft head: EXL3 GEMM over the kept 128-token blocks only, scattered into a
      full-vocab -inf row (the draft's top-1 can only be a kept token; the target verifies with the full head)."""
-@@ -945,6 +1176,245 @@ def install_mem_probe(model: torch.nn.Module, calls: int = 3, thresh_mb: int = 6
+@@ -945,6 +1179,245 @@ def install_mem_probe(model: torch.nn.Module, calls: int = 3, thresh_mb: int = 6
      logger.info("exl3xpu mem probe installed on %d modules", sum(1 for _ in model.named_modules()))
  
  
@@ -2400,7 +2410,7 @@ index bcdd003..1b4557d 100644
  def _patch_mem_probe() -> None:
      if os.environ.get("EXL3_MEM_PROBE", "0") != "1":
          return
-@@ -962,6 +1432,71 @@ def _patch_mem_probe() -> None:
+@@ -962,6 +1435,71 @@ def _patch_mem_probe() -> None:
      mr.ModelRunner.load_model = load_model
  
  
@@ -2472,7 +2482,7 @@ index bcdd003..1b4557d 100644
  def _patch_step_timing() -> None:
      """Debug (EXL3_STEP_TIMING=N): synchronized wall time of every XPU graph replay (by runner class and batch shape)
      and of each speculative decode step (EAGLEWorkerV2.forward_batch_generation, decode batches only); logs means
-@@ -1179,6 +1714,29 @@ def _cuda_compat_shim() -> None:
+@@ -1179,6 +1717,29 @@ def _cuda_compat_shim() -> None:
                  "is_current_stream_capturing} mapped to torch.xpu (XPU-only torch)")
  
  
@@ -2502,7 +2512,7 @@ index bcdd003..1b4557d 100644
  def activate() -> None:
      """sglang.srt.plugins entry point."""
      global _done
-@@ -1229,6 +1787,7 @@ def activate() -> None:
+@@ -1229,6 +1790,7 @@ def activate() -> None:
      except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
          logger.info("exl3xpu: vision shim not installed (%s)", e)
      _patch_mtp()
@@ -2510,7 +2520,7 @@ index bcdd003..1b4557d 100644
      _patch_xpu_spec_sampling()
      _patch_xpu_gdn_verify()
      _patch_xpu_mamba_scatter()
-@@ -1237,9 +1796,20 @@ def activate() -> None:
+@@ -1237,9 +1799,20 @@ def activate() -> None:
      _patch_xpu_attn_routes()
      _patch_gdn_replayssm_fold()
      _patch_xpu_graph_warm_replay()
