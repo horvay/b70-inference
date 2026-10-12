@@ -6,6 +6,7 @@
     b70 prepare <model dir> [--store DIR]  one-time per model: pack the NVMe expert store (GLM; Flash-Next fills its own)
     b70 serve <model dir> --port N [--ctx N] [--parallel N] [--name NAME] [--store DIR] [--all-ram] [--prepare]
                                            OpenAI-compatible server in the foreground; SIGTERM stops it
+    b70 run glm|sglang <command...>        run a command in an install's sandbox, without the GPU
     b70 stop                               stop a running `b70 serve`
     b70 status                             JSON: the running server, if any
 
@@ -100,7 +101,7 @@ def setup_wanted(family):
                              capture_output=True, text=True)
         return {"exllamav3": sub.stdout.strip(), "build": file_sha(os.path.join(REPO, "glm", "xpu", "build.sh"))}
     src = "dev:" + TRELLIS if os.environ.get("B70_TRELLIS_SRC") else f"{TRELLIS_COMMIT}+{patch_sha()}"
-    return {"trellis": src}
+    return {"trellis": src, "into": "rootfs"}
 
 
 def file_sha(path):
@@ -133,13 +134,15 @@ def image_env():
     return env
 
 
-def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None, template=None, drafter=None):
-    family = INSTALL.get(family, family)
-    """The bwrap command line that runs `cmd` in the image for `family`.
+def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None, template=None, drafter=None,
+            write_root=False):
+    """The bwrap command line that runs `cmd` in the image for `family`, the rootfs under a throw-away overlay (each
+    sandbox its own: a shared persistent overlay was busy for a moment after every sandbox exited).
 
-    glm: the rootfs under a throw-away overlay, glm/ at /w (its build output, pylib, run/ and cache/ live there).
-    sglang: the rootfs under a persistent overlay (state/overlay/sglang: the editable trellis-serve install and
-    oneDNN wheels setup puts there), trellis-serve at /opt/trellis-serve, flashnext/ read-only at /opt/b70."""
+    glm: glm/ at /w (its build output, pylib, run/ and cache/ live there).
+    sglang: trellis-serve at /opt/trellis-serve, flashnext/ read-only at /opt/b70; setup (write_root) installs
+    oneDNN and the editable trellis-serve into the rootfs itself, which is b70's own copy of the image."""
+    family = INSTALL.get(family, family)
     env = dict(env or {})
     img = image_env()
     args = ["bwrap"]
@@ -154,11 +157,10 @@ def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None
         env.setdefault("TRITON_CACHE_DIR", "/root/.cache/triton")
         chdir = chdir or "/w"
     else:
-        up, wk = (os.path.join(STATE, "overlay", family, d) for d in ("upper", "work"))
         cache, run = os.path.join(STATE, "cache", family), os.path.join(STATE, "run", family)
-        for d in (up, wk, cache, run):
+        for d in (cache, run):
             os.makedirs(d, exist_ok=True)
-        args += ["--overlay-src", ROOTFS, "--overlay", up, wk, "/"]
+        args += ["--bind", ROOTFS, "/"] if write_root else ["--overlay-src", ROOTFS, "--tmp-overlay", "/"]
         binds = ["--bind", TRELLIS, "/opt/trellis-serve", "--ro-bind", os.path.join(REPO, "flashnext"), "/opt/b70",
                  "--bind", run, "/run/b70", "--bind", cache, "/root/.cache"]
         chdir = chdir or "/opt/trellis-serve/xpu"
@@ -259,10 +261,24 @@ assert any(x.name == 'exl3xpu' for x in e(group='sglang.srt.plugins')); print('e
 """
 
 
+def remove_tree(path):
+    """rmtree that also clears overlayfs' mode-000 work directories."""
+    for root, dirs, _ in os.walk(path):
+        for d in dirs:
+            try:
+                os.chmod(os.path.join(root, d), 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def setup_sglang():
     fetch_trellis()
+    if running_server():
+        fail("a b70 server runs from the image setup would change; `b70 stop` first")
     say("sglang: building trellis-serve's kernels and installing the plugin (a few minutes)")
-    run_in("sglang", ["bash", "-euo", "pipefail", "-c", SGLANG_BUILD])
+    run_in("sglang", ["bash", "-euo", "pipefail", "-c", SGLANG_BUILD], write_root=True)
+    remove_tree(os.path.join(STATE, "overlay"))            # the persistent overlay of earlier setups
 
 
 def cmd_setup(a):
@@ -756,12 +772,18 @@ def running_server():
         return info
 
 
+def cmd_run(a):
+    """A command inside an install's sandbox, without the GPU (tests, studies); state/run/<install> is /run/b70."""
+    r = subprocess.run(sandbox(a.install, a.command, env={"PYTHONPATH": "/run/b70/py"} if a.install == "sglang" else None))
+    sys.exit(r.returncode)
+
+
 def cmd_status(_):
     print(json.dumps({"running": running_server()}, indent=1))
 
 
 def sandboxes():
-    """PIDs of bwrap sandboxes over this state's rootfs overlays (a server's lasts a moment past `serve`)."""
+    """PIDs of bwrap sandboxes over this state's image (a server's lasts a moment past `serve`)."""
     pids = []
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
@@ -771,7 +793,7 @@ def sandboxes():
                 argv = f.read().split(b"\0")
         except OSError:
             continue
-        if argv and os.path.basename(argv[0]) == b"bwrap" and os.path.join(STATE, "overlay").encode() in b" ".join(argv):
+        if argv and os.path.basename(argv[0]) == b"bwrap" and ROOTFS.encode() in argv:
             pids.append(int(pid))
     return pids
 
@@ -831,6 +853,10 @@ def main():
                                                           "the NVMe store, ~95 GB, once)")
     p.add_argument("--dry-run", action="store_true", help="print the sandbox command instead of running it")
     p.set_defaults(fn=cmd_serve)
+    p = sub.add_parser("run", help="run a command in an install's sandbox, without the GPU")
+    p.add_argument("install", choices=["glm", "sglang"])
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_run)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("stop").set_defaults(fn=cmd_stop)
     a = ap.parse_args()
