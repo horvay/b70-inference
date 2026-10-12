@@ -1,0 +1,3426 @@
+diff --git c/xpu/csrc/cold_read.c i/xpu/csrc/cold_read.c
+new file mode 100644
+index 0000000..58ab3a3
+--- /dev/null
++++ i/xpu/csrc/cold_read.c
+@@ -0,0 +1,68 @@
++// B70 cold tier: parallel O_DIRECT reads of expert records from the NVMe store (moe_offload.ColdStore.read).
++// Called through ctypes, which releases the GIL for the whole call: the Python thread pool it replaces took ~500
++// futures per layer and fought the main thread (which enqueues the forward) for the GIL.
++//
++//   cold_read(fd, offs, n, dst, rec, nthreads, npieces) -> 0, or -1 with errno set
++// reads n records of `rec` bytes, record i from file offset offs[i] into dst + i * rec, each record split into
++// npieces 4 KiB-aligned pieces, the n * npieces pieces spread over nthreads threads (work stealing by an atomic index).
++#define _GNU_SOURCE
++#include <errno.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#include <unistd.h>
++
++typedef struct {
++    int fd;
++    const int64_t *offs;
++    int64_t n, rec, piece, npieces;
++    char *dst;
++    atomic_long next;
++    atomic_int err;
++} job_t;
++
++static void *worker(void *arg) {
++    job_t *j = arg;
++    const int64_t total = j->n * j->npieces;
++    for (;;) {
++        int64_t k = atomic_fetch_add(&j->next, 1);
++        if (k >= total || atomic_load(&j->err)) break;
++        int64_t i = k / j->npieces, off = (k % j->npieces) * j->piece;
++        int64_t len = j->rec - off < j->piece ? j->rec - off : j->piece;
++        char *d = j->dst + i * j->rec + off;
++        int64_t got = 0;
++        while (got < len) {
++            ssize_t r = pread(j->fd, d + got, (size_t)(len - got), j->offs[i] + off + got);
++            if (r <= 0) {
++                atomic_store(&j->err, r < 0 ? errno : EIO);
++                return NULL;
++            }
++            got += r;
++        }
++    }
++    return NULL;
++}
++
++int cold_read(int fd, const int64_t *offs, int64_t n, char *dst, int64_t rec, int nthreads, int npieces) {
++    if (n <= 0) return 0;
++    if (npieces < 1) npieces = 1;
++    job_t j = {.fd = fd, .offs = offs, .n = n, .rec = rec, .npieces = npieces, .dst = dst};
++    j.piece = ((rec / 4096 + npieces - 1) / npieces) * 4096;
++    j.npieces = (rec + j.piece - 1) / j.piece;
++    atomic_init(&j.next, 0);
++    atomic_init(&j.err, 0);
++    if (nthreads > 64) nthreads = 64;
++    if ((int64_t)nthreads > n * j.npieces) nthreads = (int)(n * j.npieces);
++    pthread_t th[64];
++    int started = 0;
++    for (int t = 0; t < nthreads; t++)
++        if (pthread_create(&th[t], NULL, worker, &j) == 0) started++;
++    if (!started) worker(&j);
++    for (int t = 0; t < started; t++) pthread_join(th[t], NULL);
++    int e = atomic_load(&j.err);
++    if (e) {
++        errno = e;
++        return -1;
++    }
++    return 0;
++}
+diff --git c/xpu/csrc/exl3_moe.sycl i/xpu/csrc/exl3_moe.sycl
+index a48f1f1..9687066 100644
+--- c/xpu/csrc/exl3_moe.sycl
++++ i/xpu/csrc/exl3_moe.sycl
+@@ -418,6 +418,27 @@ ESIMD_INLINE void build4(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_
+     }
+ }
+ 
++// All NT tiles' VNNI B operands. Odd K (32 values per period): build4 over the PLANAR4 4-tile group. K=4 (8 values
++// per period, D = 1, no planarization): each tile is built on its own with the dense DPAS kernel's K=4 fast path,
++// which writes the same per-tile VNNI layout (16 x 16 tile -> 8 x 32 fp16) that the dpas calls below consume.
++template <int K, int NT>
++ESIMD_INLINE void build_tiles(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_t, NT * Geo<K>::WORDS>& prev,
++                              simd<fp16, 256 * NT>& B) {
++    if constexpr (K == 4) {
++        constexpr int W = Geo<K>::WORDS;
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            simd<uint32_t, W> dw = words.template select<W, 1>(j * W);
++            simd<uint32_t, W> pw = prev.template select<W, 1>(j * W);
++            simd<fp16, 256> Bj;
++            DpasKernel<4, 2, 8, 1>::build_k4(dw, pw, Bj);
++            B.template select<256, 1>(256 * j) = Bj;
++        }
++    } else {
++        build4<K, NT, 0>(words, prev, B);
++    }
++}
++
+ // gate|up: WG per row block b; T = 2 * (I/16) / NT threads (I=640: 20), thread = (proj, 4-tile group).
+ template <int K, int MB, typename TIn>
+ struct GateUpDpasKernel {
+@@ -491,7 +512,7 @@ struct GateUpDpasKernel {
+ #ifdef EXL3_MOE_PROBE_DPAS_NODECODE
+                 B.template select<NT * W * 2, 1>(0) = words.template bit_cast_view<fp16>();
+ #else
+-                build4<K, NT, 0>(words, prev, B);
++                build_tiles<K, NT>(words, prev, B);
+ #endif
+ #pragma unroll
+                 for (int rb = 0; rb < MB / 8; ++rb) {
+@@ -597,7 +618,7 @@ struct DownDpasKernel {
+             simd<fp16, MB * 16> Ab = block_load<fp16, MB * 16>(ablk + (((size_t)b * tk + r) * MB) * 16);
+ #endif
+             simd<fp16, 256 * NT> B;
+-            build4<K, NT, 0>(words, prev, B);
++            build_tiles<K, NT>(words, prev, B);
+ #pragma unroll
+             for (int rb = 0; rb < MB / 8; ++rb) {
+                 simd<fp16, 128> A = Ab.template select<128, 1>(rb * 128);
+@@ -767,7 +788,8 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
+     auto& q = queue_of(x);
+     int M = x.size(0), H = gm.H, I = gm.I, topk = topk_ids.size(1), npairs = M * topk;
+     constexpr int MB = kPrefillMB;
+-    TORCH_CHECK(gm.K == 3 && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0, "moe prefill geometry");
++    TORCH_CHECK((gm.K == 3 || gm.K == 4) && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0,
++                "moe prefill geometry");
+     auto rb = make_route(x, npairs, E, MB);
+     launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, MB, rb.act_expert,
+                  rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of, rb.blk_a, rb.n_blk);
+@@ -776,19 +798,30 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
+     const int64_t* pp = ptrs.data_ptr<int64_t>();
+     sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+     int T1 = 2 * (I / 16) / 4;
+-    auto run_gu = [&](auto tag) {
++    auto run_gu_k = [&](auto tag, auto kt) {
+         using TIn = decltype(tag);
+-        GateUpDpasKernel<3, MB, TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), (int)x.stride(0), pp, rb.rt, rb.blk_a,
++        constexpr int KK = decltype(kt)::value;
++        GateUpDpasKernel<KK, MB, TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), (int)x.stride(0), pp, rb.rt, rb.blk_a,
+                                        rb.n_blk, reinterpret_cast<fp16*>(ablk.data_ptr()), H, I, gm.off_suh_g(),
+                                        gm.off_svh_g(), gm.off_suh_d()};
+         q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * T1, T1), props, k); });
+     };
++    auto run_gu = [&](auto tag) {
++        if (gm.K == 4) run_gu_k(tag, std::integral_constant<int, 4>{});
++        else run_gu_k(tag, std::integral_constant<int, 3>{});
++    };
+     if (!(g_debug_skip & 1)) { if (x.scalar_type() == at::kHalf) run_gu(fp16{}); else run_gu(bf16{}); }
+     int T2 = (H / 4 / 16) / 4;
+-    DownDpasKernel<3, MB, fp16> kd{reinterpret_cast<const fp16*>(ablk.data_ptr()), pp, rb.rt, rb.blk_a, rb.n_blk,
+-                                   reinterpret_cast<fp16*>(y.data_ptr()), H, I, gm.gu_bytes(), gm.off_svh_d()};
+-    if (!(g_debug_skip & 2))
++    auto run_dn = [&](auto kt) {
++        constexpr int KK = decltype(kt)::value;
++        DownDpasKernel<KK, MB, fp16> kd{reinterpret_cast<const fp16*>(ablk.data_ptr()), pp, rb.rt, rb.blk_a, rb.n_blk,
++                                        reinterpret_cast<fp16*>(y.data_ptr()), H, I, gm.gu_bytes(), gm.off_svh_d()};
+         q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * 4 * T2, T2), props, kd); });
++    };
++    if (!(g_debug_skip & 2)) {
++        if (gm.K == 4) run_dn(std::integral_constant<int, 4>{});
++        else run_dn(std::integral_constant<int, 3>{});
++    }
+     int n = M * (H / 128), local = 8;
+     auto run_c = [&](auto tag) {
+         using TO = decltype(tag);
+@@ -959,7 +992,7 @@ static void launch_ensure(sycl::queue& q, const int* ids, int npairs, int layer,
+                 int old = slot_key[s];
+                 if (old >= 0) {
+                     slot_of[old] = -1;
+-                    ptrs_all[old] = host_base[old / E] + (int64_t)(old % E) * blob;
++                    ptrs_all[old] = host_base[old];   // per-expert home (B70 static tier: compacted host rows)
+                 }
+                 int key = layer * E + e;
+                 slot_key[s] = key; slot_of[key] = s;
+@@ -1023,7 +1056,7 @@ struct PfWorker {
+                 for (int i = 0; i < n; ++i) {
+                     int e = pl[4 + i], s = pl[4 + E + i];
+                     q.memcpy(reinterpret_cast<void*>(slot_base + (int64_t)s * blob),
+-                             reinterpret_cast<const void*>(host_base[li] + (int64_t)e * blob), (size_t)blob);
++                             reinterpret_cast<const void*>(host_base[(size_t)li * E + e]), (size_t)blob);
+                 }
+                 (void)T; (void)c;
+                 lvv[0] = seq;                                   // stable host source for the done flag
+@@ -1050,7 +1083,9 @@ void moe_prefetch_worker_start(at::Tensor plans, at::Tensor host_base_cpu, int64
+     w->q = c10::xpu::getCurrentXPUStream().queue();
+     w->plans = reinterpret_cast<int*>(plans.data_ptr());
+     w->L = (int)n_layers; w->E = (int)n_experts;
+-    w->host_base.assign(host_base_cpu.data_ptr<int64_t>(), host_base_cpu.data_ptr<int64_t>() + n_layers);
++    TORCH_CHECK(host_base_cpu.numel() == n_layers * n_experts, "prefetch worker: host_base must be per expert");
++    w->host_base.assign(host_base_cpu.data_ptr<int64_t>(),
++                        host_base_cpu.data_ptr<int64_t>() + n_layers * n_experts);
+     w->slot_base = slot_base; w->blob = blob;
+     w->ptrs_all = ptrs_all.data_ptr<int64_t>(); w->slot_last = slot_last.data_ptr<int>();
+     w->done_seq = done_seq.data_ptr<int>();
+@@ -1101,7 +1136,7 @@ struct PrefetchCopyKernel {
+         int i = wg / chunks, c = wg % chunks;
+         if (i >= pf_list[0]) return;
+         int e = pf_list[1 + i], s = pf_slot[i];
+-        const uint32_t* src = reinterpret_cast<const uint32_t*>(host_base[layer] + (int64_t)e * blob);
++        const uint32_t* src = reinterpret_cast<const uint32_t*>(host_base[(int64_t)layer * E + e]);
+         uint32_t* dst = reinterpret_cast<uint32_t*>(slot_base + (int64_t)s * blob);
+         int64_t nd = blob / 4;
+         int64_t d0 = (int64_t)c * 16384 + (int64_t)t * 1024;    // dwords
+@@ -1207,16 +1242,23 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
+     int MR = pair_mode ? 1 : g_mr_override ? g_mr_override : (M <= 64 ? 2 : 4);
+     const int64_t* pp = ptrs.data_ptr<int64_t>();
+     fp16* ab = reinterpret_cast<fp16*>(abuf.data_ptr());
+-    TORCH_CHECK(K == 3, "moe: K=3 only in this build");
+-    if (g_debug_skip & 1) {}
+-    else if (x.scalar_type() == at::kHalf)
+-        gateup_dispatch<3, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+-    else if (x.scalar_type() == at::kBFloat16)
+-        gateup_dispatch<3, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+-    else TORCH_CHECK(false, "x dtype");
++    TORCH_CHECK(K == 3 || K == 4, "moe: K=3 or K=4 only in this build (K=", K, ")");
++    auto run_gu = [&](auto kt) {
++        constexpr int KK = decltype(kt)::value;
++        if (g_debug_skip & 1) {}
++        else if (x.scalar_type() == at::kHalf)
++            gateup_dispatch<KK, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
++        else if (x.scalar_type() == at::kBFloat16)
++            gateup_dispatch<KK, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
++        else TORCH_CHECK(false, "x dtype");
++    };
++    if (K == 4) run_gu(std::integral_constant<int, 4>{}); else run_gu(std::integral_constant<int, 3>{});
+     int dn_p_save = g_dn_p;
+     if (g_dn_p == 0) g_dn_p = M <= 1 ? 10 : 5;   // M=2: P=10 120.9 us vs P=5 112.8
+-    if (!(g_debug_skip & 2)) down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
++    if (!(g_debug_skip & 2)) {
++        if (K == 4) down_dispatch<4>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
++        else down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
++    }
+     g_dn_p = dn_p_save;
+     int n = M * (H / 128), local = 8;
+     auto run_c = [&](auto tag) {
+diff --git c/xpu/csrc/ngram_nvme_xpu.sycl i/xpu/csrc/ngram_nvme_xpu.sycl
+index 8b507ab..ced411e 100644
+--- c/xpu/csrc/ngram_nvme_xpu.sycl
++++ i/xpu/csrc/ngram_nvme_xpu.sycl
+@@ -671,47 +671,6 @@ void ngram_hash_tokens(torch::Tensor tokens, torch::Tensor mult, torch::Tensor s
+     }
+ }
+ 
+-// XPU entry points (raw pointers are USM host addresses; kernels on the current torch XPU stream).
+-// Every GPU access to the shared host words is a system-scope atomic RMW: plain / atomic loads and stores to host USM
+-// can sit in the GPU L3 between kernels of one in-order queue (no flush without a host-visible event), which hung the
+-// back-to-back publish -> wait pair (host never saw req_seq) and could serve stale resp lines on graph replay.
+-void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::Tensor& dseq)
+-{
+-    TORCH_CHECK(ids.is_xpu() && ids.is_contiguous(), "nvme_publish: ids");
+-    TORCH_CHECK(dseq.is_xpu() && dseq.scalar_type() == at::kInt, "nvme_publish: dseq");
+-    int n = (int) ids.numel();
+-    auto& q = c10::xpu::getCurrentXPUStream(ids.device().index()).queue();
+-    int64_t* req = (int64_t*) req_dev;
+-    if (n > 0)
+-    {
+-        size_t g = ((size_t) n + 255) / 256 * 256;
+-        if (ids.scalar_type() == at::kLong) {
+-            const int64_t* p = ids.data_ptr<int64_t>();
+-            q.parallel_for(sycl::nd_range<1>(g, 256), [=](sycl::nd_item<1> it) {
+-                int i = it.get_global_id(0); if (i < n) sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+-                    sycl::access::address_space::global_space>(req[i]).exchange(p[i]);
+-                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system); });
+-        } else if (ids.scalar_type() == at::kInt) {
+-            const int32_t* p = ids.data_ptr<int32_t>();
+-            q.parallel_for(sycl::nd_range<1>(g, 256), [=](sycl::nd_item<1> it) {
+-                int i = it.get_global_id(0); if (i < n) sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+-                    sycl::access::address_space::global_space>(req[i]).exchange((int64_t) p[i]);
+-                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system); });
+-        } else TORCH_CHECK(false, "nvme_publish: ids int32/int64");
+-    }
+-    uint32_t* ctrl = (uint32_t*) ctrl_dev;
+-    uint32_t* ds = (uint32_t*) dseq.data_ptr<int>();
+-    q.single_task([=]() {
+-        uint32_t s = ds[0] + 1;
+-        ds[0] = s;
+-        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+-                         sycl::access::address_space::global_space>(ctrl[C_N]).exchange((uint32_t) n);
+-        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+-        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+-                         sycl::access::address_space::global_space>(ctrl[C_REQ]).exchange(s, sycl::memory_order::acq_rel);
+-    });
+-}
+-
+ // Host -> GPU direction: a system-scope atomic (even an RMW) spinning inside one kernel never observed the host's
+ // done_seq store on B70 (served from the GPU cache; 400k iterations, 2.2 us each, past the host write).  The spin and
+ // the resp read therefore use ESIMD LSC loads with L1+L3 uncached hints, which go to host memory every time.
+@@ -753,6 +712,65 @@ struct NvmeRespK {
+     }
+ };
+ 
++// XPU entry points (raw pointers are USM host addresses; kernels on the current torch XPU stream).
++// GPU -> host words: plain stores can sit in the GPU L3 between kernels of one in-order queue (no flush without a
++// host-visible event), which hung the back-to-back publish -> wait pair (host never saw req_seq). Upstream used
++// system-scope atomic RMWs, but on B70 an atomic access that page-faults on host USM cannot be resolved (xe only
++// services atomic faults by migrating to VRAM: "Fault response: Unsuccessful -EINVAL", engine CAT error), and under
++// RAM pressure the xe shrinker unbinds host buffers, so the first publish after that killed the context. ESIMD LSC
++// stores with L1+L3 uncached hints write through to host memory as ordinary (fault-resolvable) writes.
++template <typename T>
++struct NvmePubK {
++    const T* ids; int64_t* req; int n;
++    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
++        int base = (int) item.get_global_id(0) * 16;
++        esn::simd_mask<16> m = esn::simd<int32_t, 16>(base, 1) < n;
++        esn::simd<uint32_t, 16> offi(0, sizeof(T));
++        esn::simd<T, 16> v = xe::lsc_gather<T, 1, xe::lsc_data_size::default_size, xe::cache_hint::none,
++                                            xe::cache_hint::none, 16>(ids + base, offi, m);
++        esn::simd<int64_t, 16> w = v;
++        esn::simd<uint32_t, 16> off(0, 8);
++        xe::lsc_scatter<int64_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached,
++                        16>(req + base, off, w, m);
++        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
++    }
++};
++struct NvmeSeqK {
++    uint32_t* ctrl; uint32_t* ds; uint32_t n;
++    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
++        esn::simd<uint32_t, 1> z(0);
++        uint32_t s = xe::lsc_gather<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached,
++                                    xe::cache_hint::uncached>(ds, z)[0] + 1;
++        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached>(
++            ds, z, esn::simd<uint32_t, 1>(s));
++        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached>(
++            ctrl + C_N, z, esn::simd<uint32_t, 1>(n));
++        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
++        xe::lsc_scatter<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached, xe::cache_hint::uncached>(
++            ctrl + C_REQ, z, esn::simd<uint32_t, 1>(s));
++        esn::fence<esn::memory_kind::global, esn::fence_flush_op::none, esn::fence_scope::system>();
++    }
++};
++
++void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::Tensor& dseq)
++{
++    TORCH_CHECK(ids.is_xpu() && ids.is_contiguous(), "nvme_publish: ids");
++    TORCH_CHECK(dseq.is_xpu() && dseq.scalar_type() == at::kInt, "nvme_publish: dseq");
++    int n = (int) ids.numel();
++    auto& q = c10::xpu::getCurrentXPUStream(ids.device().index()).queue();
++    int64_t* req = (int64_t*) req_dev;
++    if (n > 0)
++    {
++        size_t g = (((size_t) n + 15) / 16 + 15) / 16 * 16;
++        if (ids.scalar_type() == at::kLong)
++            q.parallel_for(sycl::nd_range<1>(g, 16), NvmePubK<int64_t>{ids.data_ptr<int64_t>(), req, n});
++        else if (ids.scalar_type() == at::kInt)
++            q.parallel_for(sycl::nd_range<1>(g, 16), NvmePubK<int32_t>{ids.data_ptr<int32_t>(), req, n});
++        else TORCH_CHECK(false, "nvme_publish: ids int32/int64");
++    }
++    q.parallel_for(sycl::nd_range<1>(1, 1), NvmeSeqK{(uint32_t*) ctrl_dev, (uint32_t*) dseq.data_ptr<int>(), (uint32_t) n});
++}
++
+ void nvme_wait(int64_t ctrl_dev, const at::Tensor& dseq, at::Tensor& stall, int64_t resp_dev, at::Tensor& slots,
+                int64_t n, int64_t timeout_ns)
+ {
+diff --git c/xpu/exl3xpu/fused_xpu.py i/xpu/exl3xpu/fused_xpu.py
+new file mode 100644
+index 0000000..aa80610
+--- /dev/null
++++ i/xpu/exl3xpu/fused_xpu.py
+@@ -0,0 +1,187 @@
++"""Fused small-op kernels for Qwen3.8-Flash-Next on XPU (Triton), replacing chains of PyTorch ops that ran as separate
++kernels on the B70 (2026-10-12 eager decode profile, per token):
++
++  * router (TopK.forward_xpu, 48 layers): softmax over 512 experts, torch.topk (two radix-sort kernels), renormalise,
++    plus the cold-tier routing bias: ~19 kernels per layer, 2.8 ms. Here one kernel per layer: optional ranking bias
++    (cold experts -1e4, RAM margin for experts outside a device slot), softmax of the unbiased logits, top-k by k
++    argmax passes, weights renormalised as SGLang does (sum + 1e-20).
++  * hyper-connection norm (GroupedGemmaRMSNorm, 96 calls): fp32 casts, pow, mean, rsqrt, two muls, cast back:
++    ~10 kernels per call, 2.5 ms. Here one kernel per call, same fp32 math.
++
++  * hyper-connection combine (GatedResidual.combine, 96 calls): a oneDNN GEMM for the 4 x 10240 inject weights
++    (~15 us each) plus a compiled elementwise kernel. Here one kernel: each program recomputes the four inject dot
++    products from the normed input (L2-resident), then writes its slice of x + block_output * 2 sigmoid(dot / hc).
++
++EXL3_FUSED_ROUTER=0 / EXL3_FUSED_HCNORM=0 / EXL3_FUSED_HCCOMBINE=0 turn them off.
++"""
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++ROUTER = os.environ.get("EXL3_FUSED_ROUTER", "1") == "1"
++HCNORM = os.environ.get("EXL3_FUSED_HCNORM", "1") == "1"
++HCCOMBINE = os.environ.get("EXL3_FUSED_HCCOMBINE", "0") == "1"   # off: 15.6 us vs SGLang 5.8 us in a graph
++
++
++@triton.jit
++def _router_kernel(logit_ptr, cold_ptr, slot_ptr, margin_ptr, w_ptr, id_ptr, E, K: tl.constexpr,
++                   HAS_BIAS: tl.constexpr, HAS_MARGIN: tl.constexpr, RENORM: tl.constexpr, BLOCK: tl.constexpr):
++    r = tl.program_id(0)
++    e = tl.arange(0, BLOCK)
++    em = e < E
++    x = tl.load(logit_ptr + r * E + e, mask=em, other=-float("inf")).to(tl.float32)
++    mx = tl.max(x, axis=0)
++    ex = tl.where(em, tl.exp(x - mx), 0.0)
++    p = ex / tl.sum(ex, axis=0)
++    score = x
++    if HAS_BIAS:
++        score = score + tl.load(cold_ptr + e, mask=em, other=0.0)
++        if HAS_MARGIN:
++            mg = tl.load(margin_ptr)
++            so = tl.load(slot_ptr + e, mask=em, other=0)
++            score = score - tl.where(so < 0, mg, 0.0)
++    score = tl.where(em, score, -float("inf"))
++    k = tl.arange(0, 16)
++    ids = tl.zeros((16,), dtype=tl.int32)
++    ws = tl.zeros((16,), dtype=tl.float32)
++    for i in tl.static_range(K):
++        j = tl.argmax(score, axis=0)
++        pj = tl.sum(tl.where(e == j, p, 0.0), axis=0)
++        ids = tl.where(k == i, j, ids)
++        ws = tl.where(k == i, pj, ws)
++        score = tl.where(e == j, -float("inf"), score)
++    if RENORM:
++        ws = ws / (tl.sum(tl.where(k < K, ws, 0.0), axis=0) + 1e-20)
++    tl.store(id_ptr + r * K + k, ids, mask=k < K)
++    tl.store(w_ptr + r * K + k, ws, mask=k < K)
++
++
++def router(logits: torch.Tensor, top_k: int, renormalize: bool, cold=None, slot_of=None, margin=None):
++    """(topk_weights fp32 [R, K], topk_ids int32 [R, K]) for softmax routing; with `cold` (fp32 [E]) the ranking uses
++    logits + cold - margin * (slot_of < 0), the weights stay the unbiased softmax."""
++    R, E = logits.shape
++    assert top_k <= 16 and E <= 1024
++    w = torch.empty((R, top_k), dtype=torch.float32, device=logits.device)
++    ids = torch.empty((R, top_k), dtype=torch.int32, device=logits.device)
++    if R == 0:
++        return w, ids
++    has_bias = cold is not None
++    has_margin = has_bias and margin is not None and slot_of is not None
++    lg = logits if logits.is_contiguous() else logits.contiguous()
++    _router_kernel[(R,)](lg, cold if has_bias else lg, slot_of if has_margin else lg, margin if has_margin else lg,
++                         w, ids, E, K=top_k, HAS_BIAS=has_bias, HAS_MARGIN=has_margin, RENORM=bool(renormalize),
++                         BLOCK=triton.next_power_of_2(E), num_warps=4)
++    return w, ids
++
++
++@triton.jit
++def _grouped_rmsnorm_kernel(x_ptr, w_ptr, y_ptr, N, G, eps, BLOCK: tl.constexpr):
++    """y[r, g*G:(g+1)*G] = x * rsqrt(mean(x^2) + eps) * (1 + w), per group, fp32 math (GroupedGemmaRMSNorm)."""
++    r = tl.program_id(0)
++    g = tl.program_id(1)
++    c = tl.arange(0, BLOCK)
++    m = c < G
++    off = r * N + g * G + c
++    x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
++    var = tl.sum(x * x, axis=0) / G
++    w = tl.load(w_ptr + g * G + c, mask=m, other=0.0).to(tl.float32)
++    y = x * (1.0 / tl.sqrt(var + eps)) * (1.0 + w)
++    tl.store(y_ptr + off, y.to(y_ptr.dtype.element_ty), mask=m)
++
++
++def grouped_rmsnorm(mod, x: torch.Tensor) -> torch.Tensor:
++    N = x.shape[-1]
++    G = mod.group_size or N
++    x2 = x.reshape(-1, N)
++    if not x2.is_contiguous():
++        x2 = x2.contiguous()
++    y = torch.empty_like(x2)
++    if x2.shape[0]:
++        _grouped_rmsnorm_kernel[(x2.shape[0], N // G)](x2, mod.weight, y, N, G, float(mod.variance_epsilon),
++                                                       BLOCK=triton.next_power_of_2(G), num_warps=8)
++    return y.view(x.shape)
++
++
++def install_hcnorm() -> bool:
++    if not HCNORM:
++        return False
++    from sglang.srt.layers import hyperconnection as hcm
++    C = hcm.GroupedGemmaRMSNorm
++    if getattr(C, "_exl3_fused", False):
++        return True
++    orig = C.forward
++
++    def forward(self, x):
++        if x.device.type == "xpu" and x.dtype in (torch.bfloat16, torch.float16) and self.weight.shape[-1] == x.shape[-1] \
++                and (self.group_size is None or x.shape[-1] % self.group_size == 0) \
++                and (self.group_size or x.shape[-1]) <= 8192:
++            return grouped_rmsnorm(self, x)
++        return orig(self, x)
++
++    C.forward = forward
++    C._exl3_fused = True
++    return True
++
++
++@triton.jit
++def _hc_combine_kernel(x_ptr, n_ptr, bo_ptr, wi_ptr, out_ptr, HD, HS, inv_hc, NS: tl.constexpr, BLOCK: tl.constexpr):
++    """out[r] = x[r] + block_output[r, col % HS] * 2 sigmoid(bf16(dot(normed[r], Wi[col // HS])) / hc)."""
++    r = tl.program_id(0)
++    sp = tl.program_id(1)
++    i4 = tl.arange(0, 4)
++    acc = tl.zeros((4, BLOCK), dtype=tl.float32)
++    for c0 in range(0, HD, BLOCK):
++        c = c0 + tl.arange(0, BLOCK)
++        m = c < HD
++        nv = tl.load(n_ptr + r * HD + c, mask=m, other=0.0).to(tl.float32)
++        wv = tl.load(wi_ptr + i4[:, None] * HD + c[None, :], mask=m[None, :], other=0.0).to(tl.float32)
++        acc += wv * nv[None, :]
++    dot = tl.sum(acc, axis=1).to(tl.bfloat16).to(tl.float32)                  # the reference's linear output is bf16
++    inj = 2.0 / (1.0 + tl.exp(-(dot * inv_hc)))                                 # (4,)
++    per = tl.cdiv(HD, NS)
++    for c0 in range(sp * per, sp * per + per, BLOCK):
++        c = c0 + tl.arange(0, BLOCK)
++        m = (c < HD) & (c < sp * per + per)
++        s_of = c // HS
++        g = tl.sum(tl.where(s_of[None, :] == i4[:, None], inj[:, None], 0.0), axis=0)
++        xv = tl.load(x_ptr + r * HD + c, mask=m, other=0.0).to(tl.float32)
++        bo = tl.load(bo_ptr + r * HS + (c - s_of * HS), mask=m, other=0.0).to(tl.float32)
++        tl.store(out_ptr + r * HD + c, (xv + bo * g).to(out_ptr.dtype.element_ty), mask=m)
++
++
++def hc_combine(gr, block_output: torch.Tensor, x: torch.Tensor, normed: torch.Tensor) -> torch.Tensor:
++    R, HD = x.shape
++    out = torch.empty_like(x)
++    if R:
++        ns = 8 if R <= 64 else 1
++        _hc_combine_kernel[(R, ns)](x, normed, block_output, gr.block_inject_weight.weight, out, HD, gr.hidden_size,
++                                    1.0 / gr.hc_count, NS=ns, BLOCK=1024, num_warps=8)
++    return out
++
++
++def install_hccombine() -> bool:
++    if not HCCOMBINE:
++        return False
++    from sglang.srt.layers import hyperconnection as hcm
++    G = hcm.GatedResidual
++    if getattr(G, "_exl3_fused_combine", False):
++        return True
++    orig = G.combine
++
++    def combine(self, block_output, residuals):
++        if isinstance(residuals, tuple) and len(residuals) == 2 and self.hc_count == 4 and hasattr(self, "block_inject_weight"):
++            x, n = residuals
++            if x.device.type == "xpu" and x.dim() == 2 and n.shape == x.shape and block_output.dim() == 2 \
++                    and x.shape[0] == block_output.shape[0] and x.shape[1] == 4 * self.hidden_size \
++                    and block_output.shape[1] == self.hidden_size and x.dtype == block_output.dtype == n.dtype \
++                    and x.is_contiguous() and n.is_contiguous() and block_output.is_contiguous():
++                return hc_combine(self, block_output, x, n)
++        return orig(self, block_output, residuals)
++
++    G.combine = combine
++    G._exl3_fused_combine = True
++    return True
+diff --git c/xpu/exl3xpu/hc_xpu.py i/xpu/exl3xpu/hc_xpu.py
+new file mode 100644
+index 0000000..eceb323
+--- /dev/null
++++ i/xpu/exl3xpu/hc_xpu.py
+@@ -0,0 +1,208 @@
++"""Fused hyper-connection (SGLang GatedResidual, Qwen3.8-Flash-Next: 4 streams x 2560, low rank 320, per-stream Gemma
++RMSNorm) for small row counts (decode, MTP verify) on XPU.
++
++SGLang's fast paths are CUDA-only; on XPU every mix/combine ran the eager norm (pow/mean/rsqrt/mul/cast) plus two
++torch.compile'd regions with three oneDNN GEMMs: ~12 kernels per call, 96 calls per token, ~8 ms of a 29 ms decode step.
++Here a call is three Triton kernels and each weight is read once:
++
++  k1 (grid: column chunks x low-rank blocks): partial dot products of the down projection and the inject weights with
++     y = x * (1 + w_norm), per chunk, plus the per-chunk sums of squares. The RMSNorm scale rs[stream] is constant over
++     a stream's columns, so it is applied when the partials are summed: normed = x * rs * (1 + w).
++  k2 (grid: blocks of the 2560 columns): rs per stream, t = silu(sum_c rs * pd / hc), u = sigmoid(W_up t),
++     out = mean_s(u * normed)   -> mixed input (bf16); also stores rs for the combine.
++  k3 (grid: blocks of the 10240 columns): inj = 2 sigmoid(sum_c rs * pi / hc), out = x + block_output * inj[stream].
++
++Numerics: fp32 throughout with bf16 rounding of normed and t (as the reference rounds them), so results match the
++reference within bf16 rounding, not bit for bit. EXL3_HC_FUSED=0 turns it off; rows above EXL3_HC_FUSED_ROWS (16) use
++SGLang's path. Off by default: 684 us per call in a graph against 41 us for SGLang's path (2026-10-12); kept for reference.
++"""
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++MAX_ROWS = int(os.environ.get("EXL3_HC_FUSED_ROWS", "16"))
++_CH = 512          # columns per k1 chunk (a stream of 2560 is 5 chunks)
++_LB = 64           # low-rank rows per k1 program
++_SUB = 128         # k1 inner column step
++_DB = 64           # k2 output columns per program
++_K3B = 1024        # k3 columns per program
++
++
++@triton.jit
++def _hc_k1(x_ptr, wn_ptr, wd_ptr, wi_ptr, pd_ptr, pi_ptr, ss_ptr, R, HD, L, NC,
++           HAS_INJ: tl.constexpr, CH: tl.constexpr, LB: tl.constexpr, SUB: tl.constexpr, RP: tl.constexpr):
++    c = tl.program_id(0)
++    j = tl.program_id(1)
++    r = tl.arange(0, RP)
++    rm = r < R
++    lr = j * LB + tl.arange(0, LB)
++    lm = lr < L
++    acc = tl.zeros((RP, LB), dtype=tl.float32)
++    ss = tl.zeros((RP,), dtype=tl.float32)
++    i16 = tl.arange(0, 16)
++    acc_i = tl.zeros((RP, 16), dtype=tl.float32)
++    for k0 in range(0, CH, SUB):
++        cols = c * CH + k0 + tl.arange(0, SUB)
++        xv = tl.load(x_ptr + r[:, None] * HD + cols[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
++        wn = 1.0 + tl.load(wn_ptr + cols).to(tl.float32)
++        y = xv * wn[None, :]
++        yb = y.to(tl.bfloat16)
++        w = tl.load(wd_ptr + lr[:, None] * HD + cols[None, :], mask=lm[:, None], other=0.0)
++        acc += tl.dot(yb, tl.trans(w))
++        if j == 0:
++            ss += tl.sum(xv * xv, axis=1)
++            if HAS_INJ:
++                wi = tl.load(wi_ptr + i16[:, None] * HD + cols[None, :], mask=(i16 < 4)[:, None], other=0.0)
++                acc_i += tl.dot(yb, tl.trans(wi))
++    tl.store(pd_ptr + (r[:, None] * NC + c) * L + lr[None, :], acc, mask=rm[:, None] & lm[None, :])
++    if j == 0:
++        tl.store(ss_ptr + r * NC + c, ss, mask=rm)
++        if HAS_INJ:
++            tl.store(pi_ptr + (r[:, None] * NC + c) * 4 + i16[None, :], acc_i, mask=rm[:, None] & (i16 < 4)[None, :])
++
++
++@triton.jit
++def _hc_k2(x_ptr, wn_ptr, wu_ptr, pd_ptr, ss_ptr, rs_ptr, out_ptr, R, HS, L, NC, CPS, eps, inv_hc,
++           RP: tl.constexpr, LP: tl.constexpr, NCP: tl.constexpr, DB: tl.constexpr):
++    pid = tl.program_id(0)
++    HD = 4 * HS
++    r = tl.arange(0, RP)
++    rm = r < R
++    # per-stream RMS scale from the chunk sums of squares
++    ci = tl.arange(0, NCP)
++    ssv = tl.load(ss_ptr + r[:, None] * NC + ci[None, :], mask=rm[:, None] & (ci < NC)[None, :], other=0.0)  # (RP, NCP)
++    st = ci // CPS                                                                                          # stream of chunk
++    i4 = tl.arange(0, 4)
++    rs = tl.zeros((RP, 4), dtype=tl.float32)
++    for s in tl.static_range(4):
++        tot = tl.sum(tl.where((st == s)[None, :], ssv, 0.0), axis=1)                                       # (RP,)
++        rs = tl.where(i4[None, :] == s, (1.0 / tl.sqrt(tot / HS + eps))[:, None], rs)
++    if pid == 0:
++        tl.store(rs_ptr + r[:, None] * 4 + i4[None, :], rs, mask=rm[:, None])
++    # t = silu(sum_c rs[stream(c)] * pd[c] / hc), rounded to bf16 like the reference's linear output
++    l = tl.arange(0, LP)
++    lm = l < L
++    t = tl.zeros((RP, LP), dtype=tl.float32)
++    for c in range(0, NC):
++        s_c = c // CPS
++        rsc = tl.sum(tl.where(i4[None, :] == s_c, rs, 0.0), axis=1)                                        # (RP,)
++        p = tl.load(pd_ptr + (r[:, None] * NC + c) * L + l[None, :], mask=rm[:, None] & lm[None, :], other=0.0)
++        t += p * rsc[:, None]
++    t = t * inv_hc
++    t = tl.where(lm[None, :], t / (1.0 + tl.exp(-t)), 0.0).to(tl.bfloat16)
++    d = pid * DB + tl.arange(0, DB)
++    acc = tl.zeros((RP, DB), dtype=tl.float32)
++    for s in tl.static_range(4):
++        rows = s * HS + d
++        w = tl.load(wu_ptr + rows[:, None] * L + l[None, :], mask=lm[None, :], other=0.0)                 # (DB, LP)
++        u = tl.dot(t, tl.trans(w))                                                                           # (RP, DB)
++        u = (1.0 / (1.0 + tl.exp(-u.to(tl.bfloat16).to(tl.float32))))
++        xv = tl.load(x_ptr + r[:, None] * HD + rows[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
++        wn = 1.0 + tl.load(wn_ptr + rows).to(tl.float32)
++        rss = tl.sum(tl.where(i4[None, :] == s, rs, 0.0), axis=1)
++        nrm = (xv * rss[:, None] * wn[None, :]).to(tl.bfloat16).to(tl.float32)
++        acc += u * nrm
++    tl.store(out_ptr + r[:, None] * HS + d[None, :], (acc * 0.25).to(out_ptr.dtype.element_ty), mask=rm[:, None])
++
++
++@triton.jit
++def _hc_k3(x_ptr, bo_ptr, pi_ptr, rs_ptr, out_ptr, R, HS, NC, CPS, inv_hc,
++           RP: tl.constexpr, NCP: tl.constexpr, BLK: tl.constexpr):
++    pid = tl.program_id(0)
++    HD = 4 * HS
++    r = tl.arange(0, RP)
++    rm = r < R
++    i4 = tl.arange(0, 4)
++    rs = tl.load(rs_ptr + r[:, None] * 4 + i4[None, :], mask=rm[:, None], other=0.0)                       # (RP, 4)
++    inj = tl.zeros((RP, 4), dtype=tl.float32)
++    for c in range(0, NC):
++        s_c = c // CPS
++        rsc = tl.sum(tl.where(i4[None, :] == s_c, rs, 0.0), axis=1)
++        p = tl.load(pi_ptr + (r[:, None] * NC + c) * 4 + i4[None, :], mask=rm[:, None], other=0.0)
++        inj += p * rsc[:, None]
++    inj = inj * inv_hc
++    inj = 2.0 / (1.0 + tl.exp(-inj.to(tl.bfloat16).to(tl.float32)))
++    cols = pid * BLK + tl.arange(0, BLK)
++    s_of = cols // HS
++    d = cols - s_of * HS
++    xv = tl.load(x_ptr + r[:, None] * HD + cols[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
++    bo = tl.load(bo_ptr + r[:, None] * HS + d[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
++    g = tl.zeros((RP, BLK), dtype=tl.float32)
++    for s in tl.static_range(4):
++        is_ = tl.sum(tl.where(i4[None, :] == s, inj, 0.0), axis=1)
++        g = tl.where((s_of == s)[None, :], is_[:, None], g)
++    tl.store(out_ptr + r[:, None] * HD + cols[None, :], (xv + bo * g).to(out_ptr.dtype.element_ty), mask=rm[:, None])
++
++
++def supported(gr, x: torch.Tensor) -> bool:
++    c = gr.config
++    return (x.device.type == "xpu" and x.dim() == 2 and 0 < x.shape[0] <= MAX_ROWS and gr.hc_count == 4
++            and c.hc_per_branch_norm and x.shape[1] == 4 * gr.hidden_size and gr.hidden_size % _CH == 0
++            and gr.hidden_size % _DB == 0 and x.dtype == torch.bfloat16 and hasattr(gr, "input_mix_weight_down"))
++
++
++def mix(gr, x: torch.Tensor):
++    """GatedResidual.mix for small row counts. Returns (mixed [R, HS] bf16, residual state for combine)."""
++    x = x.contiguous()
++    R, HD = x.shape
++    HS = gr.hidden_size
++    wd = gr.input_mix_weight_down.weight
++    wu = gr.input_mix_weight_up.weight
++    L = wd.shape[0]
++    NC = HD // _CH
++    CPS = HS // _CH
++    RP = 16
++    dev = x.device
++    has_inj = hasattr(gr, "block_inject_weight")
++    wi = gr.block_inject_weight.weight if has_inj else wd
++    pd = torch.empty((R, NC, L), dtype=torch.float32, device=dev)
++    pi = torch.empty((R, NC, 4), dtype=torch.float32, device=dev)
++    ss = torch.empty((R, NC), dtype=torch.float32, device=dev)
++    rs = torch.empty((R, 4), dtype=torch.float32, device=dev)
++    out = torch.empty((R, HS), dtype=torch.bfloat16, device=dev)
++    wn = gr.hc_norm.weight
++    _hc_k1[(NC, triton.cdiv(L, _LB))](x, wn, wd, wi, pd, pi, ss, R, HD, L, NC, HAS_INJ=has_inj, CH=_CH, LB=_LB,
++                                      SUB=_SUB, RP=RP, num_warps=4)
++    _hc_k2[(HS // _DB,)](x, wn, wu, pd, ss, rs, out, R, HS, L, NC, CPS, float(gr.hc_norm.variance_epsilon),
++                         1.0 / gr.hc_count, RP=RP, LP=triton.next_power_of_2(L), NCP=triton.next_power_of_2(NC),
++                         DB=_DB, num_warps=4)
++    return out, ("exl3_hc", x, pi, rs)
++
++
++def combine(gr, block_output: torch.Tensor, state) -> torch.Tensor:
++    _, x, pi, rs = state
++    R, HD = x.shape
++    HS = gr.hidden_size
++    NC = HD // _CH
++    out = torch.empty_like(x)
++    _hc_k3[(triton.cdiv(HD, _K3B),)](x, block_output.contiguous(), pi, rs, out, R, HS, NC, HS // _CH, 1.0 / gr.hc_count,
++                                     RP=16, NCP=triton.next_power_of_2(NC), BLK=_K3B, num_warps=4)
++    return out
++
++
++def install() -> bool:
++    if os.environ.get("EXL3_HC_FUSED", "0") != "1":
++        return False
++    from sglang.srt.layers import hyperconnection as hcm
++    G = hcm.GatedResidual
++    if getattr(G, "_exl3_hc", False):
++        return True
++    orig_mix, orig_combine = G.mix, G.combine
++
++    def mix_(self, hyper_input):
++        if supported(self, hyper_input):
++            return mix(self, hyper_input)
++        return orig_mix(self, hyper_input)
++
++    def combine_(self, block_output, residuals):
++        if isinstance(residuals, tuple) and len(residuals) == 4 and residuals[0] == "exl3_hc":
++            return combine(self, block_output, residuals)
++        return orig_combine(self, block_output, residuals)
++
++    G.mix, G.combine = mix_, combine_
++    G._exl3_hc = True
++    return True
+diff --git c/xpu/exl3xpu/modtime.py i/xpu/exl3xpu/modtime.py
+index 686fc06..9e2e69e 100644
+--- c/xpu/exl3xpu/modtime.py
++++ i/xpu/exl3xpu/modtime.py
+@@ -22,7 +22,7 @@ def _wrap(cls, meth, tag):
+         return
+ 
+     def w(self, *a, **k):
+-        if _DEPTH[0] > 0:                        # nested timed calls count in the outer one only
++        if _DEPTH[0] > 0 or torch.xpu.is_current_stream_capturing():   # nested: counted in the outer call
+             return orig(self, *a, **k)
+         torch.xpu.synchronize()
+         t = time.perf_counter()
+@@ -41,11 +41,43 @@ def _wrap(cls, meth, tag):
+ def install() -> None:
+     targets = [
+         ("sglang.srt.layers.moe.fused_moe_triton.layer", "FusedMoE", "forward", "moe_routed"),
+-        ("sglang.srt.layers.attention.qsa.qsa_indexer", "QSAIndexer", "forward", "qsa_indexer"),
+-        ("sglang.srt.layers.attention.qwen_sparse_attn_backend", "QwenSparseAttnBackend", "forward_extend", "qsa_attn_extend"),
+-        ("sglang.srt.layers.attention.qwen_sparse_attn_backend", "QwenSparseAttnBackend", "forward_decode", "qsa_attn_decode"),
+-        ("sglang.srt.layers.hyperconnection", "GatedResidual", "forward", "hyperconnection"),
+     ]
++    if os.environ.get("EXL3_MODTIME_QSA", "0") == "1":   # the indexer's steps instead of its whole forward
++        targets += [("sglang.srt.layers.attention.qsa.qsa_indexer", "QSAIndexer", m, "qsa_" + m)
++                    for m in ("project_qk", "apply_rope", "update_key_state_and_compress", "select_prefill_tokens",
++                              "normalize_compressed_keys")]
++        targets += [("sglang.srt.layers.attention.qwen_sparse_attn_backend", "QwenSparseAttnBackend", m, "qsa_be_" + m)
++                    for m in ("_resolve_metadata", "_logical_to_physical", "init_forward_metadata")]
++    else:
++        targets += [("sglang.srt.layers.attention.qsa.qsa_indexer", "QSAIndexer", "forward", "qsa_indexer")]
++    qsa = os.environ.get("EXL3_MODTIME_QSA", "0") == "1"
++    targets += [("sglang.srt.layers.hyperconnection", "GatedResidual", "forward", "hyperconnection")]
++    if not qsa:     # in QSA mode these outer calls would hide the steps inside them (nested calls count once)
++        targets += [
++            ("sglang.srt.layers.attention.qwen_sparse_attn_backend", "QwenSparseAttnBackend", "forward_extend", "qsa_attn_extend"),
++            ("sglang.srt.layers.attention.qwen_sparse_attn_backend", "QwenSparseAttnBackend", "forward_decode", "qsa_attn_decode"),
++            ("sglang.srt.layers.radix_attention", "RadixAttention", "forward", "full_attention"),
++        ]
++    else:           # the sparse attention itself: a module-level function the backend calls by name
++        try:
++            be = importlib.import_module("sglang.srt.layers.attention.qwen_sparse_attn_backend")
++
++            orig = be.qsa_sparse_attention
++
++            def sparse(*a, _o=orig, **k):
++                if _DEPTH[0] > 0 or torch.xpu.is_current_stream_capturing():
++                    return _o(*a, **k)
++                torch.xpu.synchronize()
++                t = time.perf_counter()
++                try:
++                    return _o(*a, **k)
++                finally:
++                    torch.xpu.synchronize()
++                    _ACC["qsa_sparse_attention"] += time.perf_counter() - t
++                    _CNT["qsa_sparse_attention"] += 1
++            be.qsa_sparse_attention = sparse
++        except Exception as e:
++            print(f"EXL3_MODTIME: qsa_sparse_attention not wrapped ({e})", file=sys.stderr, flush=True)
+     for mod, cls, meth, tag in targets:
+         try:
+             c = getattr(importlib.import_module(mod), cls)
+@@ -73,6 +105,8 @@ def install() -> None:
+         orig = base.forward
+ 
+         def fwd(self, *a, **k):
++            if torch.xpu.is_current_stream_capturing():          # graph capture: no syncs allowed
++                return orig(self, *a, **k)
+             _ACC.clear(); _CNT.clear()
+             torch.xpu.synchronize()
+             t = time.perf_counter()
+diff --git c/xpu/exl3xpu/moe_offload.py i/xpu/exl3xpu/moe_offload.py
+index dbb2ab2..f8732e1 100644
+--- c/xpu/exl3xpu/moe_offload.py
++++ i/xpu/exl3xpu/moe_offload.py
+@@ -34,6 +34,8 @@ from __future__ import annotations
+ import os
+ import threading
+ 
++import time
++
+ import torch
+ 
+ _HERE = os.path.dirname(os.path.abspath(__file__))
+@@ -66,8 +68,13 @@ def s64(p: int) -> int:
+ 
+ 
+ def planar4(tr: torch.Tensor, K: int) -> torch.Tensor:
+-    """int16 trellis [rows, tiles, 16K] -> int32 words in PLANAR4 order (K with gcd(K, 32) = 1: 8 periods/tile)."""
+-    assert K in (3, 5, 7), "PLANAR4 packing implemented for odd K (D = K words per 32-value period)"
++    """int16 trellis [rows, tiles, 16K] -> int32 words in PLANAR4 order (K with gcd(K, 32) = 1: 8 periods/tile).
++    K=4 (gcd 4: D = 1 word per period, no planes): PLANAR4 order is the plain tile-major order, so the words are
++    returned as stored (the kernels' K=4 paths read them unplanarized)."""
++    if K == 4:
++        r, n, _ = tr.shape
++        return tr.contiguous().view(torch.int32).view(r, n, 8 * K).contiguous()
++    assert K in (3, 5, 7), "PLANAR4 packing implemented for odd K and K=4"
+     r, n, _ = tr.shape
+     w = tr.contiguous().view(torch.int32).view(r, n // 4, 4, 8, K)       # [row, group, tile, period g, plane i]
+     return w.permute(0, 1, 4, 2, 3).contiguous()                         # [row, group, plane i, tile, g]
+@@ -89,6 +96,148 @@ def pack_expert(gate: dict, up: dict, down: dict, K: int, out: torch.Tensor | No
+     return out
+ 
+ 
++class ColdStore:
++    """B70 cold tier (EXL3_MOE_RAM + EXL3_MOE_COLD_STORE): expert blobs on NVMe, one 4 KiB-padded record per
++    (model layer, expert) at offset (layer * E + e) * rec. Written at load for the experts that have no host or
++    device copy (a sparse file: only those records take disk space) and read back with parallel O_DIRECT reads when a
++    prompt routes to them. `<path>.valid.npy` marks the records written for the checkpoint identified in
++    `<path>.json`, so later loads skip them and a changed RAM list only writes the new ones."""
++
++    def __init__(self, path: str, blob: int, E: int, ident: str, n_layers: int = 64, readers: int = 24,
++                 n_pieces: int = 2):
++        import concurrent.futures as cf
++        import json
++        import numpy as np
++        self.path, self.blob, self.E, self.n_layers = path, blob, E, n_layers
++        self.rec = -(-blob // 4096) * 4096
++        self.meta = {"format": "exl3xpu-cold-store-v1", "blob": blob, "rec": self.rec, "E": E, "n_layers": n_layers,
++                     "ident": ident}
++        self.valid = np.zeros(n_layers * E, dtype=bool)
++        try:
++            if json.load(open(path + ".json")) == self.meta:
++                v = np.load(path + ".valid.npy")
++                if v.shape == self.valid.shape:
++                    self.valid = v
++        except (OSError, ValueError):
++            pass
++        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
++        self.fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_DIRECT, 0o644)
++        self._dirty = False
++        self._tl = threading.local()
++        self.pool = cf.ThreadPoolExecutor(readers, thread_name_prefix="exl3-cold")
++        per = -(-(self.rec // 4096) // n_pieces) * 4096
++        self.pieces = [(o, min(per, self.rec - o)) for o in range(0, self.rec, per)]
++        self.readers, self.n_pieces = readers, n_pieces
++        self.n_written = 0
++        # native reader (csrc/cold_read.c): parallel preads in C threads, called through ctypes (no GIL held)
++        self._c = None
++        try:
++            import ctypes
++            lib = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cold_read.so"), use_errno=True)
++            lib.cold_read.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64,
++                                      ctypes.c_int, ctypes.c_int]
++            lib.cold_read.restype = ctypes.c_int
++            self._c = lib
++        except OSError:
++            pass
++
++    def _buf(self, n: int):
++        import mmap
++        import numpy as np
++        tl = self._tl
++        if getattr(tl, "n", 0) < n:
++            tl.buf = mmap.mmap(-1, n, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)     # page aligned (O_DIRECT)
++            tl.np = np.frombuffer(tl.buf, dtype=np.uint8)
++            tl.n = n
++        return tl.buf, tl.np
++
++    def has(self, layer: int, e: int) -> bool:
++        return bool(self.valid[layer * self.E + e])
++
++    def put(self, layer: int, e: int, blob_cpu: torch.Tensor) -> None:
++        """Write one expert blob (uint8 CPU tensor) unless its record is already valid."""
++        k = layer * self.E + e
++        if self.valid[k]:
++            return
++        buf, npb = self._buf(self.rec)
++        npb[:self.blob] = blob_cpu.numpy()
++        npb[self.blob:self.rec] = 0
++        mv, done = memoryview(buf)[:self.rec], 0
++        while done < self.rec:
++            r = os.pwrite(self.fd, mv[done:], k * self.rec + done)
++            if r <= 0:
++                raise IOError(f"cold store: short write of record {k}")
++            done += r
++        self.valid[k] = True
++        self._dirty = True
++        self.n_written += 1
++
++    def flush(self) -> None:
++        """Persist the valid map (after the records it marks are on disk)."""
++        import json
++        import numpy as np
++        if not self._dirty:
++            return
++        os.fsync(self.fd)
++        with open(self.path + ".valid.npy.tmp", "wb") as f:
++            np.save(f, self.valid)
++        os.replace(self.path + ".valid.npy.tmp", self.path + ".valid.npy")
++        with open(self.path + ".json.tmp", "w") as f:
++            json.dump(self.meta, f)
++        os.replace(self.path + ".json.tmp", self.path + ".json")
++        self._dirty = False
++
++    def _read_piece(self, k: int, off: int, n: int, dst: memoryview) -> None:
++        got = 0
++        while got < n:
++            r = os.preadv(self.fd, [dst[off + got:off + n]], k * self.rec + off + got)
++            if r <= 0:
++                raise IOError(f"cold store: short read of record {k}")
++            got += r
++
++    def read(self, layer: int, experts: list, dst: memoryview) -> None:
++        """O_DIRECT reads of the records of `experts` of `layer` straight into dst (a writable, 4 KiB-aligned byte
++        memoryview), record i at dst[i * rec:] (blob bytes, then padding), in parallel; blocks. Reading into the
++        destination directly runs at ~5.8 GB/s here against ~2.9 GB/s through a per-thread bounce copy."""
++        if self._c is not None and os.environ.get("EXL3_COLD_PY_READ", "0") != "1":
++            import ctypes
++            import numpy as np
++            ks = layer * self.E + np.asarray(experts, dtype=np.int64)
++            if not self.valid[ks].all():
++                raise RuntimeError(f"cold store: layer {layer} has experts that were never written")
++            offs = ks * self.rec
++            buf = (ctypes.c_char * len(dst)).from_buffer(dst)
++            if self._c.cold_read(self.fd, offs.ctypes.data, len(offs), ctypes.addressof(buf), self.rec,
++                                 self.readers, self.n_pieces) != 0:
++                raise IOError(ctypes.get_errno(), f"cold store: read of layer {layer} failed")
++            del buf
++            return
++        fs = []
++        for i, e in enumerate(experts):
++            k = layer * self.E + int(e)
++            if not self.valid[k]:
++                raise RuntimeError(f"cold store: layer {layer} expert {e} was never written")
++            row = dst[i * self.rec:(i + 1) * self.rec]
++            fs += [self.pool.submit(self._read_piece, k, off, n, row) for off, n in self.pieces]
++        for f in fs:
++            f.result()
++
++
++# prompt chunks of at least this many rows read ALL of a layer's cold experts (read ahead, no host sync on the routing);
++# smaller ones read only the ones they pick
++_COLD_ALL_MIN = int(os.environ.get("EXL3_MOE_COLD_ALL_MIN", "2048"))
++# EXL3_COLD_TIMING=1: per long prefill forward, log the read-ahead's NVMe read time, its wait for a free bounce buffer,
++# and how long the forward waited for reads (stderr "exl3xpu cold timing")
++_COLD_TIMING = os.environ.get("EXL3_COLD_TIMING", "0") == "1"
++_CT = {"wait": 0.0, "read": 0.0, "ev": 0.0, "n": 0, "layers": 0, "t0": None}
++
++
++def layer_number(key) -> int:
++    import re as _re
++    m = _re.search(r"layers\.(\d+)\.", str(key))
++    return int(m.group(1)) if m and not str(key).startswith("mtp.") else -1
++
++
+ class ExpertStore:
+     def __init__(self, H: int, I: int, K: int, n_experts: int, n_slots: int, device=None, max_layers: int = 64):
+         self.H, self.I, self.K, self.E = H, I, K, n_experts
+@@ -103,8 +252,13 @@ class ExpertStore:
+         self.host: dict = {}                                # key -> uint8 CPU tensor [E, BLOB] (USM host)
+         self.layer_index: dict = {}                         # key -> row in the device tables
+         self.slot_of: dict = {}                             # key -> cpu int32 [E] (mirror of static placement)
+-        self._host_ptr: dict = {}
++        self._host_ptr: dict = {}                           # key -> cpu int64 [E] home pointer of each expert
++        # B70 static tier (EXL3_MOE_STATIC): experts placed in a pinned device slot at load and never evicted, so they
++        # need no host copy. key -> sorted static expert ids; the host arena holds only the other experts, compacted.
++        self.static: dict = {}
++        self._pack_tmp = None                               # CPU staging for packing a static expert
+         self._stage = [None, None]
++        self._tab_ring: dict = {}                           # key -> host/device pointer-table buffers (stage_layer)
+         self._slot_ready_ev: dict = {}
+         # device-side cache state (authoritative for forward_cached)
+         LE = max_layers * n_experts
+@@ -113,7 +267,9 @@ class ExpertStore:
+         self.slot_key = torch.full((n_slots,), -1, dtype=torch.int32, device=self.dev)
+         self.slot_last = torch.full((n_slots,), -1, dtype=torch.int32, device=self.dev)
+         self.tick = torch.zeros(1, dtype=torch.int32, device=self.dev)
+-        self.host_base = torch.zeros(max_layers, dtype=torch.int64, device=self.dev)
++        # per-expert home pointer (host row for host experts, the pinned slot for static ones); the kernels read
++        # host_base[layer * E + e] wherever they repoint an evicted expert or copy one from host memory
++        self.host_base = torch.zeros(LE, dtype=torch.int64, device=self.dev)
+         self.fill_all = torch.zeros(LE, dtype=torch.int64, device=self.dev)
+         self.fill_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
+         self.pf_list = torch.zeros(1 + n_experts, dtype=torch.int32, device=self.dev)
+@@ -122,27 +278,146 @@ class ExpertStore:
+         self.done_seq = torch.zeros(0, dtype=torch.int32, device=self.dev)               # set by start_copy_prefetch
+         self.slot_base = s64(self.slots.data_ptr()) if n_slots else 0
+         self._cache_used = False            # set by forward_cached: static ops must resync from the device first
++        # B70 cold tier: experts with neither a device slot nor a host row live only in the NVMe ColdStore. The router
++        # never picks them in decode (sglang_plugin routing bias); prompts read the ones they pick on demand. Their
++        # home pointer is a dummy device blob, so a stray read is wrong data, never a fault.
++        self.cold: ColdStore | None = None
++        self.cold_mask: dict = {}                           # key -> cpu bool [E]
++        self._cold_dummy = None
++        # two USM host bounce buffers (NVMe -> device staging), each one layer's cold experts in 4 KiB records:
++        # {"mv": memoryview, "ptr": int, "ev": upload event or None, "key": key of an unconsumed prefetch or None}
++        self._cold_bufs: list = []
++        self._cold_rr = 0
++        self._cold_pf: dict = {}                            # key -> (future, buffer index): read-ahead of all cold experts
++        self._cold_reader = None                            # one thread issuing the read-aheads (in order)
++        self._cold_ids: dict = {}                           # key -> (cpu int64 ids, device int64 ids) of its cold experts
++        self.cold_reads = 0
+ 
+     # ---- layers
+-    def add_layer(self, key, blobs: torch.Tensor | None = None) -> torch.Tensor:
++    def add_layer(self, key, blobs: torch.Tensor | None = None, static=(), ram=None) -> torch.Tensor:
++        """Allocate layer `key`. Experts in `static` (as many as there are free slots) go into pinned device slots
++        and get no host row; the host arena holds the other experts in id order. With `ram` given (and self.cold
++        set), only the non-static experts in `ram` get a host row and the rest are cold (NVMe only). Returns the host
++        arena [n_host, BLOB]; fill experts with pack_target()/pack_done()."""
+         li = len(self.layer_index)
+         if li >= self.max_layers:
+             raise RuntimeError(f"ExpertStore: more than max_layers={self.max_layers} MoE layers")
+         self.layer_index[key] = li
+-        h = self.X.host_alloc(self.E * self.blob).view(self.E, self.blob)
+-        if blobs is not None:
+-            h.copy_(blobs)
++        st = sorted({int(e) for e in static if 0 <= int(e) < self.E})[:len(self.free_slots)]
++        self.static[key] = st
++        is_static = torch.zeros(self.E, dtype=torch.bool)
++        if st:
++            is_static[torch.tensor(st)] = True
++        is_cold = torch.zeros(self.E, dtype=torch.bool)
++        if ram is not None and self.cold is not None and layer_number(key) >= 0:
++            in_ram = torch.zeros(self.E, dtype=torch.bool)
++            r_ = [int(e) for e in ram if 0 <= int(e) < self.E]
++            if r_:
++                in_ram[torch.tensor(r_)] = True
++            is_cold = ~is_static & ~in_ram
++            if self._cold_dummy is None:
++                self._cold_dummy = torch.zeros(self.blob, dtype=torch.uint8, device=self.dev)
++        if bool(is_cold.any()):
++            self.cold_mask[key] = is_cold
++        host_ids = (~is_static & ~is_cold).nonzero().flatten()
++        n_host = int(host_ids.numel())
++        h = self.X.host_alloc(max(n_host, 1) * self.blob).view(max(n_host, 1), self.blob)[:n_host]
+         self.host[key] = h
+-        base = s64(h.data_ptr())
+-        self._host_ptr[key] = base + torch.arange(self.E, dtype=torch.int64) * self.blob
+-        self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(self._host_ptr[key])
+-        self.host_base[li] = base
+-        self.slot_of[key] = torch.full((self.E,), -1, dtype=torch.int32)
++        base = s64(h.data_ptr()) if n_host else 0
++        row_of = torch.full((self.E,), -1, dtype=torch.int64)
++        row_of[host_ids] = torch.arange(n_host, dtype=torch.int64)
++        self.row_of = getattr(self, "row_of", {})
++        self.row_of[key] = row_of
++        home = base + row_of.clamp_min(0) * self.blob
++        if bool(is_cold.any()):
++            row_of[is_cold] = -2                            # -1 static, -2 cold
++            home[is_cold] = s64(self._cold_dummy.data_ptr())
++        so = torch.full((self.E,), -1, dtype=torch.int32)
++        sls = []
++        for e in st:
++            sl = self.free_slots.pop()
++            so[e] = sl
++            self.slot_owner[sl] = (key, e)
++            sls.append(sl)
++            home[e] = self.slot_ptr(sl)
++        self._host_ptr[key] = home
++        self.slot_of[key] = so
++        if os.environ.get("EXL3_ADDR_LOG") == "1":
++            import sys as _sys
++            print(f"EXL3_ADDR store K={self.K} layer {key}: host rows [{base:#x}, {base + n_host * self.blob:#x}) "
++                  f"({n_host} experts), slots [{self.slot_base:#x}, {self.slot_base + self.n_slots * self.blob:#x}) "
++                  f"pid {os.getpid()}", file=_sys.stderr, flush=True)
++        d = self.dev
++        self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(home)
++        self.host_base[li * self.E:(li + 1) * self.E].copy_(home)
++        if st:
++            keys = torch.tensor([li * self.E + e for e in st], dtype=torch.int64)
++            slt = torch.tensor(sls, dtype=torch.int64)
++            self.slot_of_dev.index_copy_(0, keys.to(d), slt.to(torch.int32).to(d))
++            self.slot_key.index_copy_(0, slt.to(d), keys.to(torch.int32).to(d))
++            self.slot_last.index_fill_(0, slt.to(d), 0x7FFFFFFF)     # pinned: never an LRU victim
++        if blobs is not None:
++            for e in range(self.E):
++                self.pack_target(key, e).copy_(blobs[e])
++                self.pack_done(key, e)
+         return h
+ 
+     def host_view(self, key) -> torch.Tensor:
++        """The host arena [n_host, BLOB] in host-expert order (row_of[key][e]), NOT indexed by expert id."""
+         return self.host[key]
+ 
++    def check_ptrs(self, key, table: torch.Tensor | None = None, what: str = "") -> None:
++        """EXL3_PTR_CHECK=1 debug: every expert pointer of layer `key` (and every home pointer) must lie inside a real
++        allocation - a device slot, the layer's host rows or a staging buffer - and be blob-aligned there. Raises
++        before a kernel could fault on a bad address. Syncs; never inside graph capture."""
++        if os.environ.get("EXL3_PTR_CHECK") != "1" or torch.xpu.is_current_stream_capturing():
++            return
++        li = self.layer_index[key]
++        n_host = self.host[key].shape[0]
++        hb = s64(self.host[key].data_ptr()) if n_host else 0
++        ranges = [(self.slot_base, self.slot_base + self.n_slots * self.blob, "slots")]
++        if self._cold_dummy is not None:
++            b = s64(self._cold_dummy.data_ptr())
++            ranges.append((b, b + self.blob, "cold-dummy"))
++        if n_host:
++            ranges.append((hb, hb + n_host * self.blob, "host"))
++        for i, st in enumerate(self._stage):
++            if st is not None:
++                b = s64(st.data_ptr())
++                ranges.append((b, b + st.numel(), f"stage{i}"))
++        tabs = {"ptrs": (table if table is not None else self.ptrs(key)).cpu(),
++                "home": self.host_base[li * self.E:(li + 1) * self.E].cpu()}
++        for name, t in tabs.items():
++            for e in range(self.E):
++                p_ = int(t[e])
++                ok = any(lo <= p_ < hi and (p_ - lo) % self.blob == 0 for lo, hi, _ in ranges)
++                if not ok:
++                    raise RuntimeError(f"EXL3_PTR_CHECK {what} {key} {name}[{e}] = {p_:#x} is outside every allocation "
++                                       f"{[(hex(lo), hex(hi), n) for lo, hi, n in ranges]}")
++
++    def is_static(self, key, e: int) -> bool:
++        return int(self.row_of[key][e]) == -1
++
++    def is_cold(self, key, e: int) -> bool:
++        return int(self.row_of[key][e]) == -2
++
++    def pack_target(self, key, e: int) -> torch.Tensor:
++        """Where to pack expert e: its host row, or a CPU staging blob for a static expert (pack_done copies it to
++        the expert's pinned slot) or a cold one (pack_done writes it to the NVMe store)."""
++        r = int(self.row_of[key][e])
++        if r >= 0:
++            return self.host[key][r]
++        if self._pack_tmp is None:
++            self._pack_tmp = torch.empty(self.blob, dtype=torch.uint8)
++        return self._pack_tmp
++
++    def pack_done(self, key, e: int) -> None:
++        r = int(self.row_of[key][e])
++        if r == -1:
++            self.slots[int(self.slot_of[key][e])].copy_(self._pack_tmp)    # blocking: load time only
++        elif r == -2:
++            self.cold.put(layer_number(key), e, self._pack_tmp)
++
+     def ptrs(self, key) -> torch.Tensor:
+         li = self.layer_index[key]
+         return self.ptrs_all[li * self.E:(li + 1) * self.E]
+@@ -170,7 +445,7 @@ class ExpertStore:
+                 ev = self._slot_ready_ev.pop(sl, None)
+                 if ev is not None:
+                     s_.wait_event(ev)
+-                self.X.memcpy_async(self.slot_ptr(sl), s64(self.host[key][e].data_ptr()), self.blob)
++                self.X.memcpy_async(self.slot_ptr(sl), int(self._host_ptr[key][e]), self.blob)
+                 self.slot_owner[sl] = (key, e)
+                 so[e] = sl
+                 es.append(e)
+@@ -190,10 +465,11 @@ class ExpertStore:
+         so = self.slot_of[key]
+         li = self.layer_index[key]
+         es, sls = [], []
++        st = set(self.static.get(key, ()))
+         for e in experts:
+             e = int(e)
+             sl = int(so[e])
+-            if sl < 0:
++            if sl < 0 or e in st:
+                 continue
+             es.append(e)
+             sls.append(sl)
+@@ -242,6 +518,7 @@ class ExpertStore:
+         and are written through into the LRU slot (committed at the end of the call). No host sync, graph-safe.
+         Do not mix with make_resident/evict on the same slots while cached calls are queued."""
+         ids, w = self._rt(topk_ids, topk_w)
++        self.check_ptrs(key, what="forward_cached")
+         self._cache_used = True
+         return self.X.moe_forward_cached(x, ids, w, self.ptrs_all, self.layer_index[key], self.slot_of_dev,
+                                          self.slot_key, self.slot_last, self.tick, self.host_base, self.slot_base,
+@@ -270,9 +547,9 @@ class ExpertStore:
+         self.done_seq = torch.zeros(L, dtype=torch.int32, device=self.dev)
+         self.pend.zero_()
+         self._commit_host = self.X.host_alloc(L * 2 * E * 12)
+-        hb = torch.zeros(L, dtype=torch.int64)
++        hb = torch.zeros(L * E, dtype=torch.int64)          # per-expert home pointers (the static tier)
+         for key, li in self.layer_index.items():
+-            hb[li] = int(self._host_ptr[key][0])
++            hb[li * E:(li + 1) * E] = self._host_ptr[key]
+         torch.xpu.synchronize()
+         self._pf_stream = torch.xpu.Stream()
+         with torch.xpu.stream(self._pf_stream):     # the worker submits its copies to this stream's queue
+@@ -302,37 +579,93 @@ class ExpertStore:
+         return r
+ 
+     # ---- prefill staging (FreeToken-style layer streaming)
++    def reserve_staging(self) -> None:
++        """Allocate the prefill staging buffers now (load time), so SGLang's memory profiling counts them before it
++        sizes the KV pool; allocated lazily at the first long prompt they could OOM. Each holds only a layer's
++        non-resident experts, at most E minus its static tier (static experts are pinned): ~0.74 GB instead of
++        0.95 GB at K=3 / 7,500 hot, and nothing for an all-static store. Two buffers when several layers stream
++        (double buffer), one for a single layer. Call again after adding layers; it only grows."""
++        keys = [k for k in self.layer_index if not str(k).startswith("mtp.")]
++        rows = max((self.E - len(self.static.get(k, ())) for k in keys), default=0)
++        if rows and self.cold_mask:
++            rows += -(-max(int(m.sum()) for m in self.cold_mask.values()) * (self.cold.rec - self.blob) // self.blob)
++        n_buf = 2 if len(keys) > 1 else 1
++        have = [0 if b is None else b.shape[0] for b in self._stage]
++        if all(have[b] >= rows for b in range(n_buf)):
++            return
++        self._stage = [None, None]
++        torch.xpu.empty_cache()                 # the smaller buffers this replaces (load time only)
++        for b in range(n_buf):
++            self._stage[b] = torch.empty((rows, self.blob), dtype=torch.uint8, device=self.dev)
++
+     def stage_layer(self, key, buf: int, stream) -> torch.Tensor:
+         """Copy every non-resident expert of `key` into staging buffer `buf` on `stream`; returns the pointer table
+         to pass to forward(ptrs=...) once `stream` has been waited on. Contiguous expert runs are copied together.
+         Uses the static-placement mirror (slot_of); after forward_cached calls, refresh it with sync_mirror()."""
+-        if self._stage[buf] is None:
+-            self._stage[buf] = torch.empty((self.E, self.blob), dtype=torch.uint8, device=self.dev)
+-        st = self._stage[buf]
+         self._resync()
+         so = self.slot_of[key]
+-        miss = (so < 0).nonzero().flatten().tolist()
+-        with torch.xpu.stream(stream):
+-            i = 0
+-            while i < len(miss):
+-                j = i
+-                while j + 1 < len(miss) and miss[j + 1] == miss[j] + 1:
+-                    j += 1
+-                n = j - i + 1
+-                self.X.memcpy_async(s64(st[miss[i]].data_ptr()), s64(self.host[key][miss[i]].data_ptr()), n * self.blob)
+-                i = j + 1
+-        sp = s64(st.data_ptr()) + torch.arange(self.E, dtype=torch.int64) * self.blob
++        cm = self.cold_mask.get(key)
++        # cold experts are not staged here: a prompt reads the ones it picks from NVMe (cold_fill)
++        miss = ((so < 0) if cm is None else ((so < 0) & ~cm)).nonzero().flatten().tolist()
++        self._staged_rows = getattr(self, "_staged_rows", {})
++        self._staged_rows[(key, buf)] = len(miss)
++        st = self._stage[buf]
++        if len(miss) > (0 if st is None else st.shape[0]):
++            # reserve_staging() sized the buffers at load; only a layer added later (or a debug path) gets here
++            import sys as _sys
++            print(f"exl3xpu: staging buffer {buf} grown to {len(miss)} experts at run time for {key} (OOM risk)",
++                  file=_sys.stderr, flush=True)
++            torch.xpu.current_stream().synchronize()
++            stream.synchronize()
++            self._stage[buf] = st = torch.empty((len(miss), self.blob), dtype=torch.uint8, device=self.dev)
++        home = self._host_ptr[key]
++        # missing expert miss[r] goes to staging row r (compact: the buffer holds only non-resident experts). Runs of
++        # experts adjacent both in id and in host memory are copied together; found with tensor ops, not a Python
++        # loop reading one element at a time (that was ~800 host reads per layer per prefill chunk).
++        n_miss = len(miss)
++        if n_miss:
++            m = torch.tensor(miss, dtype=torch.int64)
++            hm = home[m]
++            brk = torch.ones(n_miss, dtype=torch.bool)
++            brk[1:] = (m[1:] != m[:-1] + 1) | (hm[1:] != hm[:-1] + self.blob)
++            starts = brk.nonzero().flatten()
++            lens = torch.diff(starts, append=torch.tensor([n_miss]))
++            st_base = s64(st.data_ptr())
++            with torch.xpu.stream(stream):
++                for r, n, src in zip(starts.tolist(), lens.tolist(), hm[starts].tolist()):
++                    self.X.memcpy_async(st_base + r * self.blob, src, n * self.blob)
++        # pointer table, written into USM host memory and copied H2D asynchronously on the current (compute) stream.
++        # It used to be a blocking .to(device), which made the CPU wait for all queued GPU work at every MoE layer, so
++        # Python could never run ahead of the GPU in prefill. Two host buffers per layer, alternating; an event guards
++        # reuse (the other one was copied at least a whole forward earlier, and every prefill forward starts synced).
++        ring = self._tab_ring.get(key)
++        if ring is None:
++            ring = self._tab_ring[key] = {"i": 0, "ev": [None, None], "dev": torch.empty(self.E, dtype=torch.int64,
++                                                                                         device=self.dev),
++                                          "host": [self.X.host_alloc(self.E * 8).view(torch.int64) for _ in range(2)]}
++        i = ring["i"]
++        ring["i"] ^= 1
++        if ring["ev"][i] is not None:
++            ring["ev"][i].synchronize()
++        sp = ring["host"][i]
++        sp.zero_()
++        if n_miss:
++            sp[m] = s64(st.data_ptr()) + torch.arange(n_miss, dtype=torch.int64) * self.blob
+         if self.n_slots:
+-            dp = self.slot_base + so.clamp_min(0).to(torch.int64) * self.blob
+-            sp = torch.where(so >= 0, dp, sp)
+-        # blocking H2D: a non_blocking copy from this pageable temporary may run after it is freed (XPU)
+-        return sp.to(self.dev)
++            res = so >= 0
++            sp[res] = self.slot_base + so[res].to(torch.int64) * self.blob
++        dev = ring["dev"]
++        self.X.memcpy_async(s64(dev.data_ptr()), s64(sp.data_ptr()), self.E * 8)
++        ev = torch.xpu.Event()
++        ev.record()
++        ring["ev"][i] = ev
++        return dev
+ 
+     def reset_cache(self) -> None:
+         """Empty every slot and repoint all tables to host memory (current stream; waits for queued work)."""
+         torch.xpu.current_stream().synchronize()
+         for key, li in self.layer_index.items():
+-            self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(self._host_ptr[key])
++            self.ptrs_all[li * self.E:(li + 1) * self.E].copy_(self._host_ptr[key])   # static: their slot
+             self.slot_of[key].fill_(-1)
+         self.slot_of_dev.fill_(-1)
+         self.slot_key.fill_(-1)
+@@ -340,10 +673,169 @@ class ExpertStore:
+         self.fill_all.zero_()
+         self.pend.zero_()
+         self.slot_owner = [None] * self.n_slots
+-        self.free_slots = list(range(self.n_slots - 1, -1, -1))
++        static_slots = set()
++        d = self.dev
++        for key, li in self.layer_index.items():          # the static tier stays where it is, pinned
++            st = self.static.get(key, [])
++            if not st:
++                continue
++            sls = [int((int(self._host_ptr[key][e]) - self.slot_base) // self.blob) for e in st]
++            for e, sl in zip(st, sls):
++                self.slot_of[key][e] = sl
++                self.slot_owner[sl] = (key, e)
++                static_slots.add(sl)
++            keys = torch.tensor([li * self.E + e for e in st], dtype=torch.int64)
++            slt = torch.tensor(sls, dtype=torch.int64)
++            self.slot_of_dev.index_copy_(0, keys.to(d), slt.to(torch.int32).to(d))
++            self.slot_key.index_copy_(0, slt.to(d), keys.to(torch.int32).to(d))
++            self.slot_last.index_fill_(0, slt.to(d), 0x7FFFFFFF)
++        self.free_slots = [s for s in range(self.n_slots - 1, -1, -1) if s not in static_slots]
+         self._slot_ready_ev.clear()
+         self._cache_used = False
+ 
++    # ---- cold tier (NVMe) reads for prompts
++    def cold_fill(self, key, topk_ids: torch.Tensor, st: torch.Tensor, row0: int, table: torch.Tensor) -> torch.Tensor:
++        """Read the cold experts `topk_ids` picks from the NVMe store into staging rows st[row0:], then point `table`
++        (device int64 [E], updated in place on the current stream) at them. Syncs the host on topk_ids (prompts only,
++        never in a graph). Returns table."""
++        cm = self.cold_mask.get(key)
++        if cm is None:
++            return table
++        u = torch.unique(topk_ids).cpu().long()
++        u = u[(u >= 0) & (u < self.E)]
++        c = u[cm[u]]
++        n = int(c.numel())
++        if not n:
++            return table
++        b = self._cold_buf() or self._cold_steal()
++        if b["ev"] is not None:
++            b["ev"].synchronize()                    # its previous upload has left the bounce buffer
++        self.cold.read(layer_number(key), c.tolist(), b["mv"])
++        return self._cold_upload(key, b, c, st, row0, table)
++
++    def _cold_buf(self, exclude: int = -1) -> dict:
++        """A bounce buffer not holding an unconsumed read-ahead (allocated on first use)."""
++        if not self._cold_bufs:
++            rec = self.cold.rec
++            rows = max(int(m.sum()) for m in self.cold_mask.values())
++            for _ in range(2):        # USM host, rows padded to 4 KiB records and aligned for O_DIRECT
++                t = self.X.host_alloc(rows * rec + 4096)
++                a = (-t.data_ptr()) % 4096
++                self._cold_bufs.append({"i": len(self._cold_bufs), "t": t, "mv": memoryview(t.numpy())[a:a + rows * rec],
++                                        "ptr": s64(t.data_ptr() + a), "ev": None, "key": None})
++        for _ in range(2):
++            i = self._cold_rr
++            self._cold_rr ^= 1
++            if i != exclude and self._cold_bufs[i]["key"] is None:
++                return self._cold_bufs[i]
++        return None
++
++    def _cold_steal(self, keep=None) -> dict:
++        """Free a bounce buffer that holds an unconsumed read-ahead (of a key other than `keep`): wait, drop it."""
++        for k, (fut, i) in list(self._cold_pf.items()):
++            if k != keep:
++                fut.result()
++                del self._cold_pf[k]
++                self._cold_bufs[i]["key"] = None
++                return self._cold_bufs[i]
++        raise RuntimeError("exl3xpu: no cold bounce buffer to free")
++
++    def _cold_upload(self, key, b: dict, c: torch.Tensor, st: torch.Tensor, row0: int, table: torch.Tensor):
++        """Copy the records in bounce `b` (experts `c`, in order) into staging rows st[row0:] on the current stream and
++        point `table` at them."""
++        n = int(c.numel())
++        rec = self.cold.rec
++        # the cold experts keep the bounce's 4 KiB record stride in staging, so one copy moves them all; the pointer
++        # table addresses each record (reserve_staging adds a spare row for the padding)
++        if row0 * self.blob + n * rec > st.numel():
++            raise RuntimeError(f"exl3xpu: {key}: {row0} staged + {n} cold experts exceed the {st.shape[0]}-row staging buffer")
++        dst = s64(st.data_ptr()) + row0 * self.blob
++        self.X.memcpy_async(dst, b["ptr"], n * rec)
++        ev = torch.xpu.Event()
++        ev.record()
++        b["ev"] = ev
++        ptr = dst + torch.arange(n, dtype=torch.int64) * rec
++        table.index_copy_(0, c.to(self.dev), ptr.to(self.dev))
++        self.cold_reads += n
++        return table
++
++    def _cold_all(self, key):
++        ids = self._cold_ids.get(key)
++        if ids is None:
++            c = self.cold_mask[key].nonzero().flatten().to(torch.int64)
++            ids = self._cold_ids[key] = (c, c.to(self.dev))
++        return ids
++
++    def cold_prefetch(self, key) -> None:
++        """Start reading ALL cold experts of `key` from NVMe into a free bounce buffer in the background (a long
++        prompt chunk picks nearly all of them). No-op if already started or both buffers are taken."""
++        if key in self._cold_pf or key not in self.cold_mask:
++            return
++        b = self._cold_buf()
++        if b is None:
++            return
++        if self._cold_reader is None:
++            import concurrent.futures as cf
++            self._cold_reader = cf.ThreadPoolExecutor(1, thread_name_prefix="exl3-cold-ra")
++        b["key"] = key
++        c = self._cold_all(key)[0].tolist()
++        ev, layer = b["ev"], layer_number(key)
++
++        def job():
++            t0 = time.perf_counter()
++            if ev is not None:
++                ev.synchronize()                     # the bounce's previous upload is done
++            t1 = time.perf_counter()
++            self.cold.read(layer, c, b["mv"])
++            if _COLD_TIMING:
++                _CT["ev"] += t1 - t0
++                _CT["read"] += time.perf_counter() - t1
++                _CT["n"] += len(c)
++        self._cold_pf[key] = (self._cold_reader.submit(job), b["i"])
++
++    def cold_fill_all(self, key, st: torch.Tensor, row0: int, table: torch.Tensor) -> torch.Tensor:
++        """Long prompt chunk: every cold expert of `key` into staging rows st[row0:] (from the read-ahead when one was
++        started), without reading the chunk's routing back to the host. Returns table."""
++        if key not in self._cold_pf:
++            self.cold_prefetch(key)
++        if key not in self._cold_pf:                 # both buffers hold other (stale) read-aheads
++            self._cold_steal(keep=key)
++            self.cold_prefetch(key)
++        fut, i = self._cold_pf.pop(key)
++        t0 = time.perf_counter()
++        fut.result()
++        if _COLD_TIMING:
++            _CT["wait"] += time.perf_counter() - t0
++            _CT["layers"] += 1
++        b = self._cold_bufs[i]
++        b["key"] = None
++        return self._cold_upload(key, b, self._cold_all(key)[0], st, row0, table)
++
++    def forward_demand(self, key, x: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch.Tensor, fallback):
++        """Short prompt (below the staging threshold) in a layer with cold experts: routing is exact there, so the cold
++        experts it picks are read from NVMe into staging buffer 0 and the call runs on a copy of the pointer table
++        (host experts zero-copy, slots as cached). Without cold picks it is `fallback` (the normal path)."""
++        cm = self.cold_mask.get(key)
++        if cm is None:
++            return fallback(key, x, topk_ids, topk_w)
++        u = torch.unique(topk_ids).cpu().long()
++        if not bool(cm[u[(u >= 0) & (u < self.E)]].any()):
++            return fallback(key, x, topk_ids, topk_w)
++        cs = torch.xpu.current_stream()
++        pf = getattr(self, "_pf", None)
++        if pf is not None:
++            cs.wait_stream(pf["stream"])             # a dropped pre-staged copy may still be writing the buffer
++        if self._stage[0] is None:
++            raise RuntimeError("exl3xpu: no staging buffer for cold experts (reserve_staging was not called)")
++        table = self.cold_fill(key, topk_ids, self._stage[0], 0, self.ptrs(key).clone())
++        ids, w = self._rt(topk_ids, topk_w)
++        y = self.X.moe_forward(x, ids, w, table, self.I, self.K, self.E)
++        if pf is not None:
++            ev = torch.xpu.Event()
++            ev.record(cs)
++            pf["free"][0] = ev                        # staging into buffer 0 waits for this call
++        return y
++
+     # ---- prefill layer streaming inside a model forward (copy engine, double buffer), X004
+     def forward_prefill_staged(self, key, x: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch.Tensor) -> torch.Tensor:
+         """Prefill-size MoE for layer `key` from a device staging buffer: the layer's non-resident experts are copied
+@@ -370,6 +862,14 @@ class ExpertStore:
+             # slot map and drop pre-staged tables (their slot pointers may be stale). Within one prefill forward every
+             # MoE call is staged, so nothing else touches the cache until the forward ends.
+             torch.xpu.synchronize()
++            if _COLD_TIMING:
++                now = time.perf_counter()
++                if _CT["t0"] is not None and _CT["layers"]:
++                    import sys as _sys
++                    print(f"exl3xpu cold timing: forward {now - _CT['t0']:.2f} s (to the next forward's start), "
++                          f"{_CT['layers']} layers read ahead, {_CT['n']} experts, NVMe read {_CT['read']:.2f} s, "
++                          f"bounce wait {_CT['ev']:.2f} s, forward waited {_CT['wait']:.2f} s", file=_sys.stderr, flush=True)
++                _CT.update(wait=0.0, read=0.0, ev=0.0, n=0, layers=0, t0=now)
+             t = int(self.tick.item())
+             if pf.get("tick") != t or self._cache_used:
+                 self.sync_mirror()
+@@ -388,12 +888,20 @@ class ExpertStore:
+         if os.environ.get("EXL3_STAGE_HOSTWAIT", "0") == "1":
+             rdy.synchronize()                 # host waits for the copy-engine transfer, then enqueues the compute
+         cs.wait_event(rdy)
++        if key in self.cold_mask:
++            # cold experts, from NVMe into the rows after the staged host experts: for a long chunk all of the layer's
++            # (read ahead in the background while the previous layer computed), else only the ones this chunk picks
++            row0 = self._staged_rows.get((key, buf), 0)
++            if x.shape[0] >= _COLD_ALL_MIN:
++                table = self.cold_fill_all(key, self._stage[buf], row0, table)
++            else:
++                table = self.cold_fill(key, topk_ids, self._stage[buf], row0, table)
+         if os.environ.get("EXL3_STAGE_CHECK", "0") == "1":
+             import sys as _sys
+             li_ = self.layer_index[key]
+             devt = self.ptrs_all[li_ * self.E:(li_ + 1) * self.E]
+             stg = s64(self._stage[buf].data_ptr())
+-            in_stage = (table >= stg) & (table < stg + self.E * self.blob)
++            in_stage = (table >= stg) & (table < stg + self._stage[buf].numel())
+             mism = (~in_stage) & (table != devt)
+             sod = self.slot_of_dev[li_ * self.E:(li_ + 1) * self.E]
+             print(f"EXL3_STAGE_CHECK {key}: staged-from-slot {int((~in_stage).sum())}, device-table-in-slot "
+@@ -401,6 +909,7 @@ class ExpertStore:
+                   f"slot_of_dev>=0 {int((sod >= 0).sum())}, mismatching slot pointers {int(mism.sum())}",
+                   file=_sys.stderr, flush=True)
+         ids, w = self._rt(topk_ids, topk_w)
++        self.check_ptrs(key, table=table, what="prefill_staged")
+         y = self.X.moe_forward(x, ids, w, table, self.I, self.K, self.E)
+         if os.environ.get("EXL3_STAGE_VERIFY", "0") == "1":
+             import sys as _sys
+@@ -412,13 +921,15 @@ class ExpertStore:
+             bad_e = []
+             for e in range(self.E):
+                 p_ = int(tab[e])
+-                if stg <= p_ < stg + self.E * self.blob:
+-                    if not torch.equal(self._stage[buf][e].cpu(), self.host[key][e]):
+-                        diff = (self._stage[buf][e].cpu() != self.host[key][e]).nonzero().flatten()
++                if stg <= p_ < stg + self._stage[buf].numel():
++                    got, ref = self._stage[buf][(p_ - stg) // self.blob].cpu(), self.host[key][int(self.row_of[key][e])]
++                    if not torch.equal(got, ref):
++                        diff = (got != ref).nonzero().flatten()
+                         bad_e.append((e, int(diff.numel()), int(diff[0]), int(diff[-1])))
+                 else:
+                     s_ = (p_ - self.slot_base) // self.blob
+-                    if not torch.equal(self.slots[s_].cpu(), self.host[key][e]):
++                    r_ = int(self.row_of[key][e])          # static experts have no host copy to compare
++                    if r_ >= 0 and not torch.equal(self.slots[s_].cpu(), self.host[key][r_]):
+                         bad_e.append(("slot", e, s_))
+             print(f"EXL3_STAGE_VERIFY {key} rows {x.shape[0]} equal {torch.equal(y, y2)} "
+                   f"maxdiff {(y.float() - y2.float()).abs().max().item():.3g} corrupt {len(bad_e)} {bad_e[:4]}",
+@@ -432,6 +943,11 @@ class ExpertStore:
+         pos = layers.index(key) if key in layers else -1
+         if pos >= 0 and layers:
+             nxt = layers[(pos + 1) % len(layers)]
++            if x.shape[0] >= _COLD_ALL_MIN:
++                # NVMe read-ahead of the next two layers' cold experts (the second goes into the bounce buffer this
++                # layer just used, once its upload is done; the reader thread waits for that, not the forward)
++                self.cold_prefetch(nxt)
++                self.cold_prefetch(layers[(pos + 2) % len(layers)])
+             if nxt not in pf["buf_of"] and nxt != key:
+                 self._stage_into(nxt, 1 - buf)
+         return y
+diff --git c/xpu/exl3xpu/ngram_nvme.py i/xpu/exl3xpu/ngram_nvme.py
+index e16a310..e79dfbf 100644
+--- c/xpu/exl3xpu/ngram_nvme.py
++++ i/xpu/exl3xpu/ngram_nvme.py
+@@ -150,6 +150,11 @@ class Exl3NgramNvmeTable(torch.nn.Module):
+         # USM host buffers: the pointers are device-usable as they are
+         self.slab_dev, self.req_dev, self.resp_dev, self.ctrl_dev = (s64(s.slab_ptr()), s64(s.req_ptr()),
+                                                                       s64(s.resp_ptr()), s64(s.ctrl_ptr()))
++        if os.environ.get("EXL3_ADDR_LOG") == "1":
++            import sys as _sys
++            print(f"EXL3_ADDR ngram nvme: slab [{self.slab_dev:#x}, {self.slab_dev + self.nslots * self.row_bytes:#x}) "
++                  f"req {self.req_dev:#x} resp {self.resp_dev:#x} ctrl {self.ctrl_dev:#x} cap {self.cap} pid {os.getpid()}",
++                  file=_sys.stderr, flush=True)
+         self.register_buffer("head_bias", head_bias.to(dev, torch.float16).contiguous(), persistent=False)
+         self.register_buffer("chunk_ptrs", torch.tensor([self.slab_dev], dtype=torch.int64, device=dev), persistent=False)
+         self.dseq = torch.zeros(4, dtype=torch.int32, device=dev)
+@@ -187,6 +192,13 @@ class Exl3NgramNvmeTable(torch.nn.Module):
+     def gather(self, ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+         if ids.shape[-1] != self.num_heads:
+             raise ValueError(f"n-gram lookup expects [..., {self.num_heads}] ids, got {tuple(ids.shape)}")
++        if os.environ.get("EXL3_NGRAM_DEBUG") == "1" and not torch.xpu.is_current_stream_capturing():
++            import sys as _sys
++            torch.xpu.synchronize()
++            print(f"EXL3_NGRAM_DEBUG gather ids {tuple(ids.shape)} {ids.dtype} {ids.device} contiguous={ids.is_contiguous()} "
++                  f"min={int(ids.min())} max={int(ids.max())} rows={self.num_rows} cap={self.cap} "
++                  f"stream={torch.xpu.current_stream()} out={'given' if out is not None else 'new'}",
++                  file=_sys.stderr, flush=True)
+         flat = ids.reshape(-1)
+         if not flat.is_contiguous():
+             flat = flat.contiguous()
+diff --git c/xpu/exl3xpu/qsa_xpu.py i/xpu/exl3xpu/qsa_xpu.py
+index 1b832fe..25a5f3d 100644
+--- c/xpu/exl3xpu/qsa_xpu.py
++++ i/xpu/exl3xpu/qsa_xpu.py
+@@ -85,6 +85,8 @@ def qsa_sparse_attention_union(q: torch.Tensor, k_cache: torch.Tensor, v_cache:
+     # invalid (-1) entries go to a spare column nu (dropped): writing them anywhere real could clear a selected key
+     col = torch.where(valid, torch.searchsorted(uni, token_slots.clamp_min(0).to(uni.dtype)),
+                       torch.full_like(token_slots, nu, dtype=torch.long))
++    if _SDPA:
++        return _union_sdpa(q, k_cache, v_cache, valid, uni, col, scale, out)
+     kk = k_cache.index_select(0, uni.long()).to(torch.bfloat16).permute(1, 2, 0).contiguous()   # [Hk, D, nu]
+     vv = v_cache.index_select(0, uni.long()).to(torch.bfloat16).transpose(0, 1).contiguous()   # [Hk, nu, D]
+     B = max(8, min(R, _DENSE_SCORE_BYTES // max(1, Hq * nu * 6)))
+@@ -104,15 +106,159 @@ def qsa_sparse_attention_union(q: torch.Tensor, k_cache: torch.Tensor, v_cache:
+     return out
+ 
+ 
++_SDPA = os.environ.get("EXL3_QSA_SDPA", "1") == "1"
++_SDPA_ROWS = int(os.environ.get("EXL3_QSA_SDPA_ROWS", "1024"))
++
++
++def _union_sdpa(q, k_cache, v_cache, valid, uni, col, scale, out):
++    """The union attention through torch's fused SDPA with a boolean mask (EXL3_QSA_SDPA=1, default): the masked
++    fp32 score matrices never reach memory. At 8192 query rows over 16K keys this is 56 ms per layer against 278 ms
++    for the matmul/softmax/matmul loop, same result to bf16 rounding (tests/bench_qsa_attn.py). A row with no selected
++    key gives NaN in SDPA; the reference gives 0 for it, so NaN rows are zeroed."""
++    R, Hq, D = q.shape
++    nu = int(uni.numel())
++    kk = k_cache.index_select(0, uni.long()).to(torch.bfloat16).transpose(0, 1).unsqueeze(0)    # [1, Hk, nu, D]
++    vv = v_cache.index_select(0, uni.long()).to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
++    for r0 in range(0, R, _SDPA_ROWS):
++        r1 = min(R, r0 + _SDPA_ROWS)
++        n = r1 - r0
++        mask = torch.zeros((n, nu + 1), dtype=torch.bool, device=q.device)
++        mask.scatter_(1, col[r0:r1].long(), True)
++        o = torch.nn.functional.scaled_dot_product_attention(
++            q[r0:r1].to(torch.bfloat16).transpose(0, 1).unsqueeze(0), kk, vv,
++            attn_mask=mask[:, :nu].view(1, 1, n, nu), scale=scale, enable_gqa=True)
++        out[r0:r1] = torch.nan_to_num_(o[0].transpose(0, 1), nan=0.0).to(q.dtype)
++    return out
++
++
++# ---- decode / small row counts: one fused split-K kernel (gather by slot + fp8 -> bf16 + online softmax), after the
++# trellis CUDA lane's qsa_decode_triton.py (1523a13), reading the paged cache through token_slots instead of a packed
++# copy. The reference path above ran ~35 kernels per layer: 136 us per layer in a decode graph on the B70.
++_TRITON_DECODE = os.environ.get("EXL3_QSA_TRITON_DECODE", "0") == "1"   # off: 272 us vs 55 us reference (B70, 2026-10-12)
++_tl_kernels = None
++
++
++def _qsa_kernels():
++    global _tl_kernels
++    if _tl_kernels is not None:
++        return _tl_kernels
++    import triton
++    import triton.language as tl
++
++    @triton.jit
++    def split_kernel(Q, K, V, SL, PO, PM, PL, scale, S, NSPLIT, sq_r, sq_h, sk_n, sk_h, ss_r,
++                     G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr, BLOCK_SPLIT: tl.constexpr, BN: tl.constexpr):
++        r = tl.program_id(0)
++        h = tl.program_id(1)
++        sp = tl.program_id(2)
++        rows = tl.arange(0, GP)
++        dims = tl.arange(0, D)
++        qmask = rows < G
++        q = tl.load(Q + r * sq_r + (h * G + rows)[:, None] * sq_h + dims[None, :], mask=qmask[:, None], other=0.0)
++        q = q.to(tl.bfloat16)
++        m = tl.full([GP], float("-inf"), tl.float32)
++        l = tl.zeros([GP], tl.float32)
++        acc = tl.zeros([GP, D], tl.float32)
++        lo = sp * BLOCK_SPLIT
++        for n0 in range(0, BLOCK_SPLIT, BN):
++            cols = lo + n0 + tl.arange(0, BN)
++            slot = tl.load(SL + r * ss_r + cols, mask=cols < S, other=-1).to(tl.int64)
++            kmask = slot >= 0
++            off = tl.where(kmask, slot, 0)[:, None] * sk_n + h * sk_h + dims[None, :]
++            k = tl.load(K + off, mask=kmask[:, None], other=0.0).to(tl.bfloat16)
++            v = tl.load(V + off, mask=kmask[:, None], other=0.0).to(tl.bfloat16)
++            sc = tl.dot(q, tl.trans(k)).to(tl.bfloat16).to(tl.float32) * scale     # the reference's bf16 einsum
++            sc = tl.where(kmask[None, :], sc, float("-inf"))
++            m_new = tl.maximum(m, tl.max(sc, 1))
++            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++            p = tl.exp(sc - m_safe[:, None])
++            alpha = tl.exp(m - m_safe)
++            l = l * alpha + tl.sum(p, 1)
++            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
++            m = m_new
++        base = (r * tl.num_programs(1) + h) * NSPLIT + sp
++        tl.store(PO + base * GP * D + rows[:, None] * D + dims[None, :], acc)
++        tl.store(PM + base * GP + rows, m)
++        tl.store(PL + base * GP + rows, l)
++
++    @triton.jit
++    def merge_kernel(PO, PM, PL, O, so_r, so_h, NSPLIT, HKV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr,
++                     D: tl.constexpr, SP: tl.constexpr):
++        r = tl.program_id(0)
++        hq = tl.program_id(1)
++        h = hq // G
++        g = hq % G
++        sp = tl.arange(0, SP)
++        smask = sp < NSPLIT
++        base = (r * HKV + h) * NSPLIT + sp
++        ms = tl.load(PM + base * GP + g, mask=smask, other=float("-inf"))
++        ls = tl.load(PL + base * GP + g, mask=smask, other=0.0)
++        mx = tl.max(ms, 0)
++        mx_safe = tl.where(mx == float("-inf"), 0.0, mx)
++        w = tl.where(smask, tl.exp(ms - mx_safe), 0.0)
++        den = tl.sum(w * ls, 0)
++        dims = tl.arange(0, D)
++        po = tl.load(PO + (base * GP + g)[:, None] * D + dims[None, :], mask=smask[:, None], other=0.0)
++        num = tl.sum(po * w[:, None], 0)
++        out = tl.where(den > 0, num / den, 0.0)                                     # no valid slot -> 0, like the reference
++        tl.store(O + r * so_r + hq * so_h + dims, out.to(O.dtype.element_ty))
++
++    _tl_kernels = (split_kernel, merge_kernel, triton)
++    return _tl_kernels
++
++
++def qsa_sparse_attention_decode(q, k_cache, v_cache, token_slots, softmax_scale=None, block_split=128, bn=32):
++    split_kernel, merge_kernel, triton = _qsa_kernels()
++    scale = softmax_scale or q.shape[-1] ** -0.5
++    R, Hq, D = q.shape
++    Hk = k_cache.shape[1]
++    G = Hq // Hk
++    GP = max(16, triton.next_power_of_2(G))
++    S = token_slots.shape[1]
++    nsplit = triton.cdiv(S, block_split)
++    po = torch.empty((R, Hk, nsplit, GP, D), dtype=torch.float32, device=q.device)
++    pm = torch.empty((R, Hk, nsplit, GP), dtype=torch.float32, device=q.device)
++    pl = torch.empty((R, Hk, nsplit, GP), dtype=torch.float32, device=q.device)
++    q = q.contiguous()
++    sl = token_slots if token_slots.stride(-1) == 1 else token_slots.contiguous()
++    split_kernel[(R, Hk, nsplit)](q, k_cache, v_cache, sl, po, pm, pl, float(scale), S, nsplit, q.stride(0), q.stride(1),
++                                  k_cache.stride(0), k_cache.stride(1), sl.stride(0), G=G, GP=GP, D=D,
++                                  BLOCK_SPLIT=block_split, BN=bn, num_warps=4)
++    out = torch.empty_like(q)
++    merge_kernel[(R, Hq)](po, pm, pl, out, out.stride(0), out.stride(1), nsplit, HKV=Hk, G=G, GP=GP, D=D,
++                          SP=triton.next_power_of_2(nsplit), num_warps=4)
++    return out
++
++
+ def qsa_sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale=None):
+     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
+         raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
+     capturing = hasattr(torch.xpu, "is_current_stream_capturing") and torch.xpu.is_current_stream_capturing()
+     if q.shape[0] >= _DENSE_MIN_ROWS and not capturing and os.environ.get("EXL3_QSA_UNION", "1") == "1":
+         return qsa_sparse_attention_union(q, k_cache, v_cache, token_slots, softmax_scale)
++    if _TRITON_DECODE and q.shape[0] <= 64 and k_cache.shape[1] <= q.shape[1] and q.shape[-1] in (64, 128, 256) \
++            and v_cache.shape == k_cache.shape and k_cache.stride(-1) == 1:
++        return qsa_sparse_attention_decode(q, k_cache, v_cache, token_slots, softmax_scale)
+     return qsa_sparse_attention_reference(q, k_cache, v_cache, token_slots, softmax_scale)
+ 
+ 
++def _expand_fast():
++    """SGLang's expand_qsa_block_indices runs its Triton kernel on CUDA only and a stable argsort per row elsewhere:
++    26 ms per layer at 8192 rows on the B70 against 0.3 ms for the same Triton kernel, bit-identical
++    (tests/bench_qsa_select.py). Use the Triton kernel on XPU outside graph capture (EXL3_QSA_TRITON_EXPAND=1, default);
++    captured decode graphs keep the torch version."""
++    from sglang.srt.layers.attention.qsa import kernel as K
++    torch_fn, triton_fn = K.torch_expand_qsa_block_indices, K.triton_expand_qsa_block_indices
++
++    def expand_qsa_block_indices(block_indices, query_positions, sequence_lengths, compress_ratio, token_topk):
++        capturing = hasattr(torch.xpu, "is_current_stream_capturing") and torch.xpu.is_current_stream_capturing()
++        if block_indices.device.type == "xpu" and not capturing:
++            return triton_fn(block_indices.contiguous(), query_positions.to(device=block_indices.device).contiguous(),
++                             sequence_lengths.to(device=block_indices.device).contiguous(), compress_ratio, token_topk)
++        return torch_fn(block_indices, query_positions, sequence_lengths, compress_ratio, token_topk)
++    return expand_qsa_block_indices
++
++
+ def install() -> None:
+     import importlib
+     patched = []
+@@ -124,8 +270,14 @@ def install() -> None:
+         except Exception as e:  # pragma: no cover
+             logger.info("exl3xpu: QSA shim: %s not importable (%s)", mod_name, e)
+             continue
+-        for name, fn in (("qsa_fast_topk", qsa_fast_topk), ("qsa_sparse_attention", qsa_sparse_attention),
+-                         ("qsa_sparse_attention_reference", qsa_sparse_attention_reference)):
++        fns = [("qsa_fast_topk", qsa_fast_topk), ("qsa_sparse_attention", qsa_sparse_attention),
++               ("qsa_sparse_attention_reference", qsa_sparse_attention_reference)]
++        if os.environ.get("EXL3_QSA_TRITON_EXPAND", "1") == "1":
++            try:
++                fns.append(("expand_qsa_block_indices", _expand_fast()))
++            except Exception as e:  # pragma: no cover
++                logger.info("exl3xpu: QSA shim: Triton expand not available (%s)", e)
++        for name, fn in fns:
+             if hasattr(m, name):
+                 setattr(m, name, fn)
+                 patched.append(f"{mod_name.rsplit('.', 1)[-1]}.{name}")
+diff --git c/xpu/exl3xpu/sglang_plugin.py i/xpu/exl3xpu/sglang_plugin.py
+index bcdd003..1b4557d 100644
+--- c/xpu/exl3xpu/sglang_plugin.py
++++ i/xpu/exl3xpu/sglang_plugin.py
+@@ -16,6 +16,7 @@ import logging
+ import os
+ import re
+ import struct
++import time
+ from typing import Any
+ 
+ import torch
+@@ -117,24 +118,90 @@ def _unpack_signs(packed: torch.Tensor) -> torch.Tensor:
+     return (1.0 - 2.0 * bits.flatten()).to(torch.float16)
+ 
+ 
+-_MOE_STORE = None
++_MOE_STORES: dict = {}     # K (trellis bits) -> ExpertStore; one slot arena per expert size
+ _MOE_HOT = None
+ _MOE_CACHE = os.environ.get("EXL3_MOE_CACHE", "0") == "1"
++_MOE_PROFILE = os.environ.get("EXL3_MOE_PROFILE", "")    # path: per-layer routing counts + prefill MoE time (JSON)
++_PROF: dict = {"layers": {}, "events": [], "rows": 0, "last": 0.0, "started": False}
++
++
++def _prof_count(key: str, ids: torch.Tensor) -> None:
++    """EXL3_MOE_PROFILE: count routed (token, expert) assignments of layer `key` on the device, decode (<= 4 rows) and
++    prefill apart. index_add_ is graph-safe, so decode graph replays count too; the counters were allocated at load
++    (allocating them during capture would re-zero them on every replay)."""
++    c = _PROF["layers"].get(key)
++    if c is None:
++        return
++    idx = ids.reshape(-1).long()
++    c["decode" if ids.shape[0] <= 4 else "prefill"].index_add_(0, idx, torch.ones_like(idx))
++
++
++def _prof_dump(force: bool = False) -> None:
++    """Write the counters (prefill, eager only: syncs). The first dump zeroes them instead, dropping the server's own
++    warm-up and graph-capture calls. Decode counts reach the file at the next prefill."""
++    import time as _t
++    now = _t.monotonic()
++    if not force and now - _PROF["last"] < 2.0:
++        return
++    _PROF["last"] = now
++    torch.xpu.synchronize()
++    if not _PROF["started"]:
++        _PROF["started"] = True
++        for c in _PROF["layers"].values():
++            c["decode"].zero_()
++            c["prefill"].zero_()
++        _PROF["events"].clear()
++        _PROF["rows"] = 0
++        return
++    ms = sum(a.elapsed_time(b) for a, b in _PROF["events"])
++    out = {"layers": {k: {"decode": c["decode"].tolist(), "prefill": c["prefill"].tolist()}
++                      for k, c in _PROF["layers"].items()},
++           "prefill_moe_ms": ms, "prefill_moe_calls": len(_PROF["events"]), "prefill_moe_rows": _PROF["rows"]}
++    with open(_MOE_PROFILE + ".tmp", "w") as f:
++        json.dump(out, f)
++    os.replace(_MOE_PROFILE + ".tmp", _MOE_PROFILE)
+ _STAGE_MIN_M = int(os.environ.get("EXL3_MOE_STAGE_MIN_M", "512"))   # >= rows: prefill layer streaming (0 = off)
++# B70 cold tier: EXL3_MOE_RAM (JSON {layer_key: [expert ids]}) lists the non-static experts that keep a host (RAM) copy;
++# the rest live only in the NVMe store EXL3_MOE_COLD_STORE. Decode (decode / target-verify batches, or any graph) routes only to
++# experts with a device or host copy, and with EXL3_MOE_RAM_MARGIN > 0 lowers the router logit of experts not in a
++# device slot by that much (ranking only; the weights come from the unbiased logits). Prompts route exactly and read
++# the cold experts they pick from NVMe.
++_DECODE_ROWS = 4
++_DECODE_MODE = [False]     # set around each ModelRunner forward: True for decode and MTP target-verify batches
++_RAM_MARGIN = float(os.environ.get("EXL3_MOE_RAM_MARGIN", "0"))
++_ROUTE_BIAS: dict = {}     # layer key -> {"cold": device fp32 [E] (0 / -1e4), "slot_of": device int32 [E]}
++# EXL3_MOE_ROUTE_CTL=<json file>: runtime control for tuning, re-read when it changes (checked at most once a second, at
++# the start of a forward): {"margin": float, "bias_prompts": bool}. "margin" replaces EXL3_MOE_RAM_MARGIN live (also
++# inside captured decode graphs: they read the margin from a device tensor); "bias_prompts" applies the decode routing to
++# prompts too, so teacher-forced prompt logprobs show what decode routing does to quality (test use only).
++_ROUTE_CTL = os.environ.get("EXL3_MOE_ROUTE_CTL", "")
++_CTL = {"margin_t": None, "bias_prompts": False, "mtime": None, "checked": 0.0}
+ if _STAGE_MIN_M <= 0:
+     _STAGE_MIN_M = 1 << 30
+ 
+ 
+ def _moe_store(H: int, I: int, K: int, n_experts: int):
+-    """Process-wide ExpertStore (one slot arena shared by all MoE layers incl. the MTP layer)."""
+-    global _MOE_STORE
+-    if _MOE_STORE is None:
++    """Process-wide ExpertStore per expert bit width K (one slot arena shared by all MoE layers of that K, incl. the
++    MTP layer). K=3 is the main store (EXL3_MOE_SLOTS slots, LRU cache + optional static tier). Any other K (e.g. the
++    4-bit layer 0 of some 3.05 bpw checkpoints) gets its own store of EXL3_MOE_SLOTS_K<K> slots (default 512, one
++    layer) whose layers are placed in pinned device slots entirely (all experts static, no host copy)."""
++    s = _MOE_STORES.get(K)
++    if s is None:
+         from .moe_offload import ExpertStore
+-        _MOE_STORE = ExpertStore(H, I, K, n_experts, int(os.environ.get("EXL3_MOE_SLOTS", "0")), _dev())
+-        logger.info("exl3xpu: expert store: %d device slots x %d B (%.2f GB)", _MOE_STORE.n_slots, _MOE_STORE.blob,
+-                    _MOE_STORE.n_slots * _MOE_STORE.blob / 1e9)
+-    s = _MOE_STORE
+-    if (s.H, s.I, s.K, s.E) != (H, I, K, n_experts):
++        env = "EXL3_MOE_SLOTS" if K == 3 else f"EXL3_MOE_SLOTS_K{K}"
++        slots = int(os.environ.get(env, "0" if K == 3 else str(n_experts)))
++        s = _MOE_STORES[K] = ExpertStore(H, I, K, n_experts, slots, _dev())
++        s.all_static = K != 3
++        if K == 3 and os.environ.get("EXL3_MOE_RAM"):
++            from .moe_offload import ColdStore
++            path = os.environ.get("EXL3_MOE_COLD_STORE")
++            if not path:
++                raise ValueError("exl3xpu: EXL3_MOE_RAM needs EXL3_MOE_COLD_STORE (NVMe path for the cold experts)")
++            s.cold = ColdStore(f"{path}.k{K}", s.blob, n_experts, _checkpoint_ident())
++            logger.info("exl3xpu: cold expert store %s.k%d: %d records already written", path, K, int(s.cold.valid.sum()))
++        logger.info("exl3xpu: expert store K=%d: %d device slots x %d B (%.2f GB)%s", K, s.n_slots, s.blob,
++                    s.n_slots * s.blob / 1e9, ", every expert static" if s.all_static else "")
++    if (s.H, s.I, s.E) != (H, I, n_experts):
+         raise NotImplementedError(f"exl3xpu: MoE layers with different geometry {(H, I, K, n_experts)} vs {(s.H, s.I, s.K, s.E)}")
+     return s
+ 
+@@ -147,6 +214,70 @@ def _moe_hot() -> dict:
+     return _MOE_HOT
+ 
+ 
++def _layer_list(path_env: str, key: str):
++    """{layer_key: [ids]} JSON named by env `path_env`: the entry for `key`, matched exactly or by layer number."""
++    p = os.environ.get(path_env)
++    if not p:
++        return None
++    cache = _LISTS.get(p)
++    if cache is None:
++        cache = _LISTS[p] = json.load(open(p))
++    if key in cache:
++        return list(cache[key])
++    m = re.search(r"layers\.(\d+)\.", key)
++    if m:
++        for k, v in cache.items():
++            m2 = re.search(r"layers\.(\d+)\.", k)
++            if m2 and m2.group(1) == m.group(1):
++                return list(v)
++    return None
++
++
++_LISTS: dict = {}
++
++
++def _moe_ram(key: str):
++    """EXL3_MOE_RAM: the non-static experts of `key` that keep a host copy (None: all of them, no cold tier)."""
++    if key.startswith("mtp."):
++        return None
++    return _layer_list("EXL3_MOE_RAM", key)
++
++
++def _checkpoint_ident() -> str:
++    """Identity of the checkpoint for the cold store (file names, sizes, mtimes of its safetensors)."""
++    import hashlib
++    d = os.environ.get("EXL3_MODEL_PATH", "")
++    h = hashlib.sha1(d.encode())
++    try:
++        for f in sorted(os.listdir(d)):
++            if f.endswith(".safetensors"):
++                st = os.stat(os.path.join(d, f))
++                h.update(f"{f}:{st.st_size}:{int(st.st_mtime)}".encode())
++    except OSError:
++        pass
++    return h.hexdigest()
++
++
++def _moe_static(key: str) -> list:
++    """EXL3_MOE_STATIC=1: layer `key`'s EXL3_MOE_HOT experts become the static tier (pinned device slots, no host
++    copy). Matched by the exact key, else by the layer number ('layers.N.'). The MTP layer has no profile;
++    EXL3_MOE_STATIC_MTP=1 pins all of its experts (it runs every draft step; EXL3_MOE_SLOTS must have room)."""
++    if os.environ.get("EXL3_MOE_STATIC", "0") != "1":
++        return []
++    if key.startswith("mtp."):
++        return list(range(512)) if os.environ.get("EXL3_MOE_STATIC_MTP", "0") == "1" else []
++    hot = _moe_hot()
++    if key in hot:
++        return list(hot[key])
++    m = re.search(r"layers\.(\d+)\.", key)
++    if m:
++        for k, v in hot.items():
++            m2 = re.search(r"layers\.(\d+)\.", k)
++            if m2 and m2.group(1) == m.group(1):
++                return list(v)
++    return []
++
++
+ def _build_classes():
+     from sglang.srt.layers.quantization.base_config import LinearMethodBase, QuantizationConfig
+     from sglang.srt.utils.common import set_weight_attrs
+@@ -375,7 +506,10 @@ def _build_classes():
+             self.method.process_weights_after_loading(self)
+ 
+         def forward(self, x):
+-            return self.method.apply(self, x)
++            if x.dim() == 2:
++                return self.method.apply(self, x)
++            y = self.method.apply(self, x.reshape(-1, self.in_features).contiguous())
++            return y.view(*x.shape[:-1], self.out_features)
+ 
+ 
+     from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+@@ -449,9 +583,14 @@ def _build_classes():
+                 raise NotImplementedError(f"exl3xpu: {self.prefix}: mixed K inside expert {e}")
+             store = _moe_store(layer.exl3_hidden, layer.exl3_inter, K, layer.exl3_num_experts)
+             if self.key not in store.host:
+-                store.add_layer(self.key)
+-            from .moe_offload import pack_expert
+-            pack_expert(st["gate"], st["up"], st["down"], K, out=store.host_view(self.key)[e])
++                static_ids = range(layer.exl3_num_experts) if getattr(store, "all_static", False) else _moe_static(self.key)
++                store.add_layer(self.key, static=static_ids,
++                                ram=None if getattr(store, "all_static", False) else _moe_ram(self.key))
++            from .moe_offload import pack_expert, layer_number
++            # a cold expert already in the NVMe store from an earlier load needs no packing
++            if not (store.is_cold(self.key, e) and store.cold.has(layer_number(self.key), e)):
++                pack_expert(st["gate"], st["up"], st["down"], K, out=store.pack_target(self.key, e))
++                store.pack_done(self.key, e)
+             layer.exl3_K = K
+             layer.exl3_packed = getattr(layer, "exl3_packed", 0) + 1
+             del layer.exl3_store[e]
+@@ -480,13 +619,35 @@ def _build_classes():
+             hot = _moe_hot().get(self.key, [])
+             per = int(os.environ.get("EXL3_MOE_RESIDENT_PER_LAYER", "0"))
+             want = list(dict.fromkeys(list(hot) + list(range(n))))[:max(per, len(hot))] if (per or hot) else []
++            cm = store.cold_mask.get(self.key)
++            if cm is not None:
++                want = [e for e in want if not bool(cm[e])]     # a cold expert has no copy to make resident from
+             want = want[:len(store.free_slots)]
+             if want:
+                 store.make_resident(self.key, want)
++            store.reserve_staging()
++            if store.cold is not None:
++                store.cold.flush()
++            from .moe_offload import layer_number
++            if layer_number(self.key) >= 0 and not getattr(store, "all_static", False) and (cm is not None or _RAM_MARGIN > 0 or _ROUTE_CTL):
++                li = store.layer_index[self.key]
++                cold = torch.zeros(n, dtype=torch.float32)
++                if cm is not None:
++                    cold[cm] = -1e4
++                if _CTL["margin_t"] is None:
++                    _CTL["margin_t"] = torch.full((), _RAM_MARGIN, dtype=torch.float32, device=store.dev)
++                _ROUTE_BIAS[self.key] = {"cold": cold.to(store.dev),
++                                         "slot_of": store.slot_of_dev[li * n:(li + 1) * n]}
++            if _MOE_PROFILE and not self.key.startswith("mtp."):
++                _PROF["layers"][self.key] = {m: torch.zeros(n, dtype=torch.int64, device=store.dev)
++                                             for m in ("decode", "prefill")}
+             layer.exl3_moe_store = store
+-            logger.info("exl3xpu: %s: %d experts K=%d packed to host USM (%.3f GB), %d resident in device slots "
+-                        "(%d slots free)", self.prefix, n, layer.exl3_K, n * store.blob / 1e9,
+-                        store.resident_count(self.key), len(store.free_slots))
++            n_static = len(store.static.get(self.key, ()))
++            n_cold = 0 if cm is None else int(cm.sum())
++            logger.info("exl3xpu: %s: %d experts K=%d, %d packed to host USM (%.3f GB), %d static, %d cold (NVMe), %d "
++                        "resident in device slots (%d slots free)", self.prefix, n, layer.exl3_K, n - n_static - n_cold,
++                        (n - n_static - n_cold) * store.blob / 1e9, n_static, n_cold, store.resident_count(self.key),
++                        len(store.free_slots))
+ 
+         def apply(self, layer, dispatch_output):
+             from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+@@ -501,7 +662,25 @@ def _build_classes():
+             else:
+                 store.prefill_reset()
+                 fwd = store.forward_cached if _MOE_CACHE else store.forward
+-            y = fwd(self.key, flat, tk.topk_ids.reshape(flat.shape[0], -1), tk.topk_weights.reshape(flat.shape[0], -1))
++                if not _is_decode_call() and self.key in store.cold_mask:
++                    # short prompt: routed exactly, so it may pick cold experts; read those from NVMe
++                    base = fwd
++                    fwd = lambda k_, x_, i_, w_: store.forward_demand(k_, x_, i_, w_, base)   # noqa: E731
++            ids = tk.topk_ids.reshape(flat.shape[0], -1)
++            if _MOE_PROFILE:
++                _prof_count(self.key, ids)
++                if fwd == store.forward_prefill_staged:
++                    _prof_dump()
++                    ev0, ev1 = torch.xpu.Event(enable_timing=True), torch.xpu.Event(enable_timing=True)
++                    ev0.record()
++                    y = fwd(self.key, flat, ids, tk.topk_weights.reshape(flat.shape[0], -1))
++                    ev1.record()
++                    _PROF["events"].append((ev0, ev1))
++                    _PROF["rows"] += flat.shape[0]
++                    return StandardCombineInput(hidden_states=y.view_as(x))
++                if flat.shape[0] > 4 and not torch.xpu.is_current_stream_capturing():
++                    _prof_dump()                 # a short prefill (cached path) flushes the decode counts too
++            y = fwd(self.key, flat, ids, tk.topk_weights.reshape(flat.shape[0], -1))
+             return StandardCombineInput(hidden_states=y.view_as(x))
+ 
+         def get_triton_quant_info(self, layer):
+@@ -599,6 +778,58 @@ def _patch_mtp() -> None:
+     cls.set_lm_head_from_target = set_lm_head_from_target
+ 
+ 
++def _patch_qwen4_mtp() -> None:
++    """Qwen4-exp (Flash-Next) MTP draft: its own __init__ (not Qwen3.5's, so _patch_mtp's never runs) builds the
++    hyper-connection input fusion `fc_embedding` / `fc_hidden` (hc_count > 1) or `fc` as plain nn.Linear, but EXL3
++    checkpoints quantize them. Serve them as EXL3 linears and share the target embedding from construction. Weight
++    loading is Qwen3.5's (already patched by _patch_mtp: skips embed_tokens, finishes `fc`); the extra projections are
++    finished here."""
++    try:
++        from sglang.srt.models import qwen4_exp_mtp as m
++    except Exception as e:  # pragma: no cover
++        logger.warning("exl3xpu: Qwen4-exp MTP shim not installed (%s)", e)
++        return
++    cls = m.Qwen4ExpForCausalLMMTP
++    if cls.__dict__.get("_exl3_patched", False):      # own flag: the Qwen3.5 base class carries _patch_mtp's
++        return
++    orig_init, orig_load = cls.__init__, cls.load_weights
++
++    def __init__(self, config, quant_config=None, prefix="", *a, **k):
++        orig_init(self, config, quant_config, prefix, *a, **k)
++        Cfg, _, Dense = classes()
++        qc = getattr(self, "quant_config", quant_config)
++        if not isinstance(qc, Cfg):
++            return
++        emb = self.model.embed_tokens
++        w = emb.weight
++        emb.weight = torch.nn.Parameter(torch.empty((0, w.shape[1]), dtype=w.dtype, device=w.device), requires_grad=False)
++        for name, val in vars(w).items():
++            if name != "data" and not hasattr(emb.weight, name):
++                setattr(emb.weight, name, val)
++        self._exl3_skip_embed = True
++        del w
++        _empty_cache()
++        self._exl3_dense = []
++        for attr in ("fc_embedding", "fc_hidden", "fc"):
++            lin = getattr(self, attr, None)
++            info = qc.modules.get(f"mtp.{attr}")
++            if info is not None and isinstance(lin, torch.nn.Linear):
++                setattr(self, attr, Dense(lin.in_features, lin.out_features, info, f"mtp.{attr}",
++                                          params_dtype=lin.weight.dtype))
++                self._exl3_dense.append(attr)
++        logger.info("exl3xpu: Qwen4-exp MTP input fusion served as EXL3 linears: %s", ", ".join(self._exl3_dense) or "none")
++
++    def load_weights(self, weights, *a, **k):
++        out = orig_load(self, weights, *a, **k)
++        for attr in getattr(self, "_exl3_dense", ()):
++            lin = getattr(self, attr)
++            if attr != "fc" and hasattr(lin, "exl3_shards"):     # Qwen3.5's patched loader already finished `fc`
++                lin.process_weights_after_loading()
++        return out
++
++    cls.__init__, cls.load_weights, cls._exl3_patched = __init__, load_weights, True
++
++
+ class _DraftHeadMethod:
+     """quant_method of the pruned draft head: EXL3 GEMM over the kept 128-token blocks only, scattered into a
+     full-vocab -inf row (the draft's top-1 can only be a kept token; the target verifies with the full head)."""
+@@ -945,6 +1176,245 @@ def install_mem_probe(model: torch.nn.Module, calls: int = 3, thresh_mb: int = 6
+     logger.info("exl3xpu mem probe installed on %d modules", sum(1 for _ in model.named_modules()))
+ 
+ 
++def _is_decode_call() -> bool:
++    """A decode-side MoE call: inside a graph capture (only decode / verify graphs are captured), or a decode or MTP
++    target-verify batch (_DECODE_MODE, set by _patch_route_bias's ModelRunner hook). Batched decode and MTP verify can
++    exceed _DECODE_ROWS rows, so row counts alone would send them down the exact (NVMe-reading) prompt path."""
++    return _DECODE_MODE[0] or torch.xpu.is_current_stream_capturing()
++
++
++def _poll_route_ctl() -> None:
++    now = time.monotonic()
++    if now - _CTL["checked"] < 1.0 or _CTL["margin_t"] is None:
++        return
++    _CTL["checked"] = now
++    try:
++        mt = os.stat(_ROUTE_CTL).st_mtime_ns
++        if mt == _CTL["mtime"]:
++            return
++        with open(_ROUTE_CTL) as f:
++            c = json.load(f)
++    except (OSError, ValueError):
++        return
++    _CTL["mtime"] = mt
++    _CTL["margin_t"].fill_(float(c.get("margin", _RAM_MARGIN)))
++    _CTL["bias_prompts"] = bool(c.get("bias_prompts", False))
++    if "cold_all_min" in c:                      # A/B of the long-chunk cold read-ahead (moe_offload._COLD_ALL_MIN)
++        from . import moe_offload as _mo
++        _mo._COLD_ALL_MIN = int(c["cold_all_min"])
++    logger.info("exl3xpu: route control %s: margin %.3g, decode routing on prompts %s", _ROUTE_CTL,
++                float(c.get("margin", _RAM_MARGIN)), _CTL["bias_prompts"])
++
++
++def _patch_route_bias() -> None:
++    """B70 cold tier / RAM margin (see _ROUTE_BIAS): decode-side router calls (_is_decode_call) of the MoE layers in _ROUTE_BIAS pick their top-k from the biased logits: cold experts (NVMe only) at
++    -1e4, and experts outside a device slot lowered by the margin. The weights are recomputed from the unbiased logits
++    (softmax, renormalized over the picks when the model renormalizes), so the bias only changes which experts run.
++    Each TopK is tied to its layer's key after the model loads (layer ids alone could collide with the MTP layer)."""
++    from . import fused_xpu
++    if not os.environ.get("EXL3_MOE_RAM") and _RAM_MARGIN <= 0 and not _ROUTE_CTL and not fused_xpu.ROUTER:
++        return
++    from sglang.srt.layers.moe import topk as tkm
++    from sglang.srt.model_executor import model_runner as mr
++    orig = tkm.TopK.forward_xpu
++
++    def forward_xpu(self, hidden_states, router_logits, *a, **k):
++        b = _ROUTE_BIAS.get(getattr(self, "_exl3_key", None))
++        c = self.topk_config
++        if fused_xpu.ROUTER and not a and not k and c.scoring_func == "softmax" and c.correction_bias is None \
++                and c.custom_routing_function is None and not c.use_grouped_topk and not c.num_fused_shared_experts \
++                and not c.routed_scaling_factor and router_logits.dim() == 2 and c.top_k <= 16 \
++                and router_logits.shape[1] <= 1024:
++            # one Triton kernel instead of softmax + topk (radix sort/select) + renormalise + the bias ops
++            bias = b is not None and (_is_decode_call() or _CTL["bias_prompts"])
++            margin = bias and (_RAM_MARGIN > 0 or bool(_ROUTE_CTL))
++            w, ids = fused_xpu.router(router_logits, c.top_k, c.renormalize,
++                                      cold=b["cold"] if bias else None, slot_of=b["slot_of"] if margin else None,
++                                      margin=_CTL["margin_t"] if margin else None)
++            return tkm.StandardTopKOutput(topk_weights=w, topk_ids=ids, router_logits=router_logits)
++        if b is None or not (_is_decode_call() or _CTL["bias_prompts"]):
++            return orig(self, hidden_states, router_logits, *a, **k)
++        bias = b["cold"]
++        if _RAM_MARGIN > 0 or _ROUTE_CTL:
++            bias = bias - _CTL["margin_t"] * (b["slot_of"] < 0).to(torch.float32)
++        out = orig(self, hidden_states, (router_logits.float() + bias).to(router_logits.dtype), *a, **k)
++        if not isinstance(out, tkm.StandardTopKOutput):
++            raise NotImplementedError(f"exl3xpu: routing bias needs the standard top-k output, got {type(out).__name__}")
++        w = torch.softmax(router_logits.float(), dim=-1).gather(1, out.topk_ids.long())
++        if self.topk_config.renormalize:
++            w = w / w.sum(dim=-1, keepdim=True)
++        return out._replace(topk_weights=w.to(out.topk_weights.dtype), router_logits=router_logits)
++
++    tkm.TopK.forward_xpu = forward_xpu
++    orig_raw = mr.ModelRunner._forward_raw
++
++    def _forward_raw(self, forward_batch, *a, **k):
++        fm = forward_batch.forward_mode
++        prev = _DECODE_MODE[0]
++        if _ROUTE_CTL:
++            _poll_route_ctl()
++        _DECODE_MODE[0] = bool(fm.is_decode() or fm.is_target_verify() or fm.is_idle())
++        try:
++            return orig_raw(self, forward_batch, *a, **k)
++        finally:
++            _DECODE_MODE[0] = prev
++
++    mr.ModelRunner._forward_raw = _forward_raw
++    orig_load = mr.ModelRunner.load_model
++
++    def load_model(self, *a, **k):
++        r = orig_load(self, *a, **k)
++        # a model holds only some of the layers (the MTP draft model has its own runner and none of the main layers)
++        mine = {getattr(getattr(m, "quant_method", None), "key", None) for m in self.model.modules()} & set(_ROUTE_BIAS)
++        n = 0
++        for m in self.model.modules():
++            qm = getattr(getattr(m, "experts", None), "quant_method", None)
++            key = getattr(qm, "key", None)
++            if key in _ROUTE_BIAS and isinstance(getattr(m, "topk", None), tkm.TopK):
++                m.topk._exl3_key = key
++                n += 1
++        if mine:
++            logger.info("exl3xpu: decode routing bias on %d of %d MoE layers (cold experts masked, RAM margin %.3g)",
++                        n, len(mine), _RAM_MARGIN)
++            if n != len(mine):
++                raise RuntimeError("exl3xpu: some MoE layers with a cold tier have no TopK to bias; decode would read "
++                                   "cold experts that are not in memory")
++        return r
++
++    mr.ModelRunner.load_model = load_model
++
++
++def _patch_prof_scopes() -> None:
++    """Profiling aid (EXL3_PROF_SCOPES=1): a torch-profiler range "M:<child name>:<class>" around the forward of each
++    decoder layer's children and the MoE block's children (and the model's top-level children), so
++    scripts/prof_cats.py --scopes can attribute every device kernel to the module that launched it (eager runs; graph
++    replays do not show kernels)."""
++    if os.environ.get("EXL3_PROF_SCOPES", "0") != "1":
++        return
++    from sglang.srt.model_executor import model_runner as mr
++    orig = mr.ModelRunner.load_model
++    pat = re.compile(r"(layers\.\d+\.([^.]+)(\.([^.]+))?|^model\.([^.]+)|^model\.language_model\.([^.]+)|^(lm_head|logits_processor))$")
++
++    def load_model(self, *a, **k):
++        r = orig(self, *a, **k)
++        n = 0
++        for name, m in self.model.named_modules():
++            mm = pat.search(name)
++            if not mm or name.count("layers.") > 1:
++                continue
++            short = re.sub(r"layers\.\d+\.", "", name.split("language_model.")[-1])
++            tag = f"M:{short}:{type(m).__name__}"
++            if ".mlp." in name and not re.search(r"\.mlp\.[^.]+$", name):
++                continue
++
++            def pre(mod, args, _t=tag):
++                if torch.xpu.is_current_stream_capturing():
++                    return
++                rf = torch.autograd.profiler.record_function(_t)
++                rf.__enter__()
++                mod.__dict__.setdefault("_exl3_rf", []).append(rf)
++
++            def post(mod, args, out):
++                st = mod.__dict__.get("_exl3_rf")
++                if st:
++                    st.pop().__exit__(None, None, None)
++            m.register_forward_pre_hook(pre)
++            m.register_forward_hook(post)
++            n += 1
++        logger.info("exl3xpu: profiler scopes on %d modules", n)
++        return r
++
++    mr.ModelRunner.load_model = load_model
++
++
++def _patch_modbench() -> None:
++    """Profiling aid (EXL3_MODBENCH=1): graph-mode cost per module type. Graph replays hide their kernels from the
++    profiler, and eager kernel times mislead for small ops (a 4 x 10240 oneDNN GEMM: ~15 us eager, ~3 us in a graph).
++    While SGLang captures the batch-1 decode graph, one call of each module kind (the children of one decoder layer of
++    each layer type, and of its MoE block) is recorded with its real inputs; after capture each is replayed 50 times
++    inside its own XPU graph and timed. Logs "exl3xpu modbench" lines. Module state (KV, GDN state, expert cache) is
++    touched by the replays: restart the server after a benchmark run."""
++    if os.environ.get("EXL3_MODBENCH", "0") != "1":
++        return
++    import time as _t
++    from sglang.srt.model_executor import model_runner as mr
++    rec: dict = {}
++    pat = re.compile(r"layers\.(\d+)\.(([^.]+)(\.([^.]+))?)$")
++    orig_load = mr.ModelRunner.load_model
++    orig_init = mr.ModelRunner.init_cuda_graphs
++
++    def load_model(self, *a, **k):
++        r = orig_load(self, *a, **k)
++        if getattr(self, "is_draft_worker", False):
++            return r
++        for name, m in self.model.named_modules():
++            mm = pat.search(name)
++            if not mm or ".experts." in name:
++                continue
++            child = mm.group(2)
++            if child.startswith("mlp.") and child.count(".") > 1:
++                continue
++            kind = f"{child}:{type(m).__name__}"
++
++            lid = int(mm.group(1))
++
++            def pre(mod, args, kwargs, _k=kind, _n=name, _l=lid):
++                if _l < 4 or _k in rec or not torch.xpu.is_current_stream_capturing():
++                    return
++                x = next((t for t in list(args) + list(kwargs.values()) if isinstance(t, torch.Tensor)), None)
++                if x is not None and x.dim() >= 1 and x.shape[0] == 1:
++                    rec[_k] = (mod, args, kwargs, _n, _ctx())
++            m.register_forward_pre_hook(pre, with_kwargs=True)
++        return r
++
++    from sglang.srt.model_executor import forward_context as fcm
++
++    def _ctx():
++        return fcm.get_forward_context() if fcm.has_forward_context() else None
++
++    from sglang.srt.layers import hyperconnection as hcm
++    for meth in ("mix", "combine"):
++        f0 = getattr(hcm.GatedResidual, meth)
++
++        def wrapped(self, *a, _f=f0, _m=meth, **k):
++            kind = f"hyper_connection.{_m}:GatedResidual"
++            if kind not in rec and torch.xpu.is_current_stream_capturing() and a and a[0].shape[0] == 1:
++                rec[kind] = (lambda *a_, _s=self, **k_: _f(_s, *a_, **k_), a, k, kind, _ctx())
++            return _f(self, *a, **k)
++        setattr(hcm.GatedResidual, meth, wrapped)
++
++    def init_cuda_graphs(self, *a, **k):
++        r = orig_init(self, *a, **k)
++        if getattr(self, "is_draft_worker", False) or not rec:
++            return r
++        res = []
++        with torch.no_grad():
++            for kind, (mod, args, kwargs, name, ctx) in rec.items():
++                try:
++                    import contextlib
++                    torch.xpu.synchronize()
++                    g = torch.xpu.XPUGraph()
++                    with (fcm.forward_context(ctx) if ctx is not None else contextlib.nullcontext()), torch.xpu.graph(g):
++                        for _ in range(50):
++                            mod(*args, **kwargs)
++                    g.replay()
++                    torch.xpu.synchronize()
++                    t0 = _t.perf_counter()
++                    for _ in range(5):
++                        g.replay()
++                    torch.xpu.synchronize()
++                    res.append(((_t.perf_counter() - t0) / 250 * 1e6, kind, name))
++                    del g
++                except Exception as e:  # noqa: BLE001
++                    res.append((-1.0, kind, f"{name}: {type(e).__name__} {str(e)[:80]}"))
++        for us, kind, name in sorted(res, key=lambda x: -x[0]):
++            logger.info("exl3xpu modbench %8.1f us/call  %-60s %s", us, kind, name)
++        return r
++
++    mr.ModelRunner.load_model = load_model
++    mr.ModelRunner.init_cuda_graphs = init_cuda_graphs
++
++
+ def _patch_mem_probe() -> None:
+     if os.environ.get("EXL3_MEM_PROBE", "0") != "1":
+         return
+@@ -962,6 +1432,71 @@ def _patch_mem_probe() -> None:
+     mr.ModelRunner.load_model = load_model
+ 
+ 
++def _patch_mem_log() -> None:
++    """EXL3_MEM_LOG=N: every N s, log the torch allocator's reserved / allocated / peak-allocated VRAM (peak since the
++    last check) and the card's used VRAM (mem_get_info), when any changed. Card used minus torch reserved is what Level
++    Zero holds outside torch (graphs, kernel scratch, anything allocated around torch)."""
++    every = float(os.environ.get("EXL3_MEM_LOG", "0"))
++    if every <= 0:
++        return
++    import threading
++    import time
++    from sglang.srt.model_executor import model_runner as mr
++    orig = mr.ModelRunner.load_model
++
++    def load_model(self, *a, **k):
++        r = orig(self, *a, **k)
++        dev = torch.device("xpu", torch.xpu.current_device())
++
++        def run():
++            last = None
++            while True:
++                time.sleep(every)
++                try:
++                    g = 1 << 30
++                    free, total = torch.xpu.mem_get_info(dev)
++                    cur = (round(torch.xpu.memory_reserved(dev) / g, 2), round(torch.xpu.memory_allocated(dev) / g, 2),
++                           round(torch.xpu.max_memory_allocated(dev) / g, 2), round((total - free) / g, 2))
++                    torch.xpu.reset_peak_memory_stats(dev)
++                    if cur != last:
++                        logger.info("exl3xpu mem: torch reserved %.2f GB, allocated %.2f GB, peak allocated %.2f GB; "
++                                    "card used %.2f GB", *cur)
++                        last = cur
++                except Exception as e:  # pragma: no cover
++                    logger.warning("exl3xpu: mem log stopped (%s)", e)
++                    return
++
++        threading.Thread(target=run, name="exl3-mem-log", daemon=True).start()
++        return r
++
++    mr.ModelRunner.load_model = load_model
++
++
++def _patch_release_after_prefill() -> None:
++    """EXL3_RELEASE_AFTER_PREFILL=1: hand the torch allocator's cached free blocks back to the driver on the first
++    decode step after a prefill. A long prefill leaves ~3.5 GB of them reserved (torch reserved 28.7 GB, allocated
++    25.2), which kept the B70 at 31.85 of 31.9 GB through the reply; any allocation outside torch then made xe evict
++    the expert arena into system RAM (2026-10-06, four times, all during decode). Costs one sync per request, and the
++    next prefill allocates its blocks again."""
++    if os.environ.get("EXL3_RELEASE_AFTER_PREFILL", "0") != "1":
++        return
++    from sglang.srt.model_executor import model_runner as mr
++    orig = mr.ModelRunner.forward
++
++    def forward(self, forward_batch, *a, **k):
++        extend = forward_batch.forward_mode.is_extend()
++        if not extend and getattr(self, "_exl3_after_extend", False):
++            self._exl3_after_extend = False
++            torch.xpu.synchronize()
++            torch.xpu.empty_cache()
++        r = orig(self, forward_batch, *a, **k)
++        if extend:
++            self._exl3_after_extend = True
++        return r
++
++    mr.ModelRunner.forward = forward
++
++
+ def _patch_step_timing() -> None:
+     """Debug (EXL3_STEP_TIMING=N): synchronized wall time of every XPU graph replay (by runner class and batch shape)
+     and of each speculative decode step (EAGLEWorkerV2.forward_batch_generation, decode batches only); logs means
+@@ -1179,6 +1714,29 @@ def _cuda_compat_shim() -> None:
+                 "is_current_stream_capturing} mapped to torch.xpu (XPU-only torch)")
+ 
+ 
++def _patch_xpu_profiler() -> None:
++    """SGLang's /start_profile maps the "GPU" activity to ProfilerActivity.CUDA only, so on XPU the torch profiler
++    records no device kernels. Map it to ProfilerActivity.XPU instead (profiling only; nothing runs unless asked)."""
++    try:
++        from sglang.srt.utils import profile_utils as pu
++    except Exception:  # pragma: no cover
++        return
++    cls = getattr(pu, "_ProfilerTorch", None)
++    if cls is None or getattr(cls.start, "_exl3", False) or not hasattr(torch.profiler.ProfilerActivity, "XPU"):
++        return
++
++    def start(self):
++        m = {"CPU": torch.profiler.ProfilerActivity.CPU, "GPU": torch.profiler.ProfilerActivity.XPU,
++             "XPU": torch.profiler.ProfilerActivity.XPU}
++        self.torch_profiler = torch.profiler.profile(
++            activities=[m[a] for a in self.activities if a in m],
++            with_stack=bool(self.with_stack), record_shapes=bool(self.record_shapes))
++        self.torch_profiler.start()
++
++    start._exl3 = True
++    cls.start = start
++
++
+ def activate() -> None:
+     """sglang.srt.plugins entry point."""
+     global _done
+@@ -1229,6 +1787,7 @@ def activate() -> None:
+     except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
+         logger.info("exl3xpu: vision shim not installed (%s)", e)
+     _patch_mtp()
++    _patch_qwen4_mtp()
+     _patch_xpu_spec_sampling()
+     _patch_xpu_gdn_verify()
+     _patch_xpu_mamba_scatter()
+@@ -1237,9 +1796,20 @@ def activate() -> None:
+     _patch_xpu_attn_routes()
+     _patch_gdn_replayssm_fold()
+     _patch_xpu_graph_warm_replay()
++    _patch_route_bias()
++    from . import fused_xpu
++    if fused_xpu.install_hcnorm():
++        logger.info("exl3xpu: fused hyper-connection RMSNorm on")
++    if fused_xpu.install_hccombine():
++        logger.info("exl3xpu: fused hyper-connection combine on")
++    _patch_prof_scopes()
++    _patch_modbench()
+     _patch_mem_probe()
++    _patch_mem_log()
++    _patch_release_after_prefill()
+     _patch_xpu_mamba_extra_buffer()
+     _patch_step_timing()
++    _patch_xpu_profiler()
+     frac = os.environ.get("EXL3_TORCH_MEM_FRACTION")
+     if frac:
+         # cap the torch caching allocator so the Level Zero driver keeps room for its own allocations (kernel scratch
+diff --git c/xpu/scripts/build_ngram_nvme.sh i/xpu/scripts/build_ngram_nvme.sh
+index d54288f..4128790 100755
+--- c/xpu/scripts/build_ngram_nvme.sh
++++ i/xpu/scripts/build_ngram_nvme.sh
+@@ -5,7 +5,7 @@ set -euo pipefail
+ cd "$(dirname "$0")/.."
+ T=$(python3 -c "import torch,os;print(os.path.dirname(torch.__file__))")
+ PY=$(python3 -c "import sysconfig;print(sysconfig.get_paths()['include'])")
+-icpx -fsycl -fsycl-targets=spir64 -O3 -fPIC -std=c++17 -shared -march=native -D_GLIBCXX_USE_CXX11_ABI=1 \
++icpx -fsycl -fsycl-targets=spir64 -O3 -fPIC -std=c++17 -shared -march=x86-64-v3 -mclflushopt -D_GLIBCXX_USE_CXX11_ABI=1 \
+   -DTORCH_EXTENSION_NAME=exl3xpu_ngram_nvme -DTORCH_API_INCLUDE_EXTENSION_H \
+   -I$T/include -I$T/include/torch/csrc/api/include -I$PY \
+   -x c++ csrc/ngram_nvme_xpu.sycl -x none -o ${EXL3_NVME_OUT:-exl3xpu/exl3xpu_ngram_nvme.so} \
+diff --git c/xpu/tests/bench_qsa_attn.py i/xpu/tests/bench_qsa_attn.py
+new file mode 100644
+index 0000000..e790b95
+--- /dev/null
++++ i/xpu/tests/bench_qsa_attn.py
+@@ -0,0 +1,102 @@
++"""
++QSA sparse prefill attention on the B70: the plugin's union path (exl3xpu.qsa_xpu.qsa_sparse_attention_union) against
++candidate replacements, on synthetic data at Qwen3.8-Flash-Next shapes (Hq 24, Hk 2, head_dim 256, 2048 selected
++tokens per query as 512 blocks of 4 plus the local tail). Reports time and max difference to the union output.
++
++  python3 tests/bench_qsa_attn.py --rows 8192 --keys 16384
++"""
++import argparse
++import os
++import sys
++import time
++
++import torch
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, ".."))
++from exl3xpu import qsa_xpu  # noqa: E402
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--rows", type=int, default=8192)
++ap.add_argument("--keys", type=int, default=16384)
++ap.add_argument("--iters", type=int, default=3)
++a = ap.parse_args()
++dev = torch.device("xpu", 0)
++Hq, Hk, D, RATIO, TOPK = 24, 2, 256, 4, 2048
++R, L = a.rows, a.keys
++g = torch.Generator(device="cpu").manual_seed(0)
++
++# paged fp8 KV pool with the sequence's tokens scattered over physical slots (like SGLang's pool)
++n_slots = L + 4096
++perm = torch.randperm(n_slots, generator=g)[:L]              # logical token -> physical slot
++k_cache = (torch.randn((n_slots, Hk, D), generator=g) * 0.5).to(torch.float8_e4m3fn).to(dev)
++v_cache = (torch.randn((n_slots, Hk, D), generator=g) * 0.5).to(torch.float8_e4m3fn).to(dev)
++q = (torch.randn((R, Hq, D), generator=g) * 0.5).to(torch.bfloat16).to(dev)
++
++# selection: query r sits at position L - R + r; it sees blocks entirely before it and picks min(512, n) of them
++# (biased towards recent ones, as the indexer tends to), plus its partial tail block
++pos = torch.arange(L - R, L)
++logical = torch.full((R, TOPK + RATIO - 1), -1, dtype=torch.long)
++for r in range(R):
++    p = int(pos[r])
++    nb = (p + 1) // RATIO
++    if nb:
++        w = torch.linspace(0.2, 1.0, nb) ** 4
++        k = min(TOPK // RATIO, nb)
++        blocks = torch.multinomial(w, k, replacement=False, generator=g).sort().values
++        toks = (blocks.unsqueeze(1) * RATIO + torch.arange(RATIO)).flatten()
++        logical[r, :toks.numel()] = toks
++        n = toks.numel()
++    else:
++        n = 0
++    tail = torch.arange(nb * RATIO, p + 1)
++    logical[r, n:n + tail.numel()] = tail
++slots = torch.where(logical >= 0, perm[logical.clamp_min(0)], torch.full_like(logical, -1)).to(torch.int32).to(dev)
++scale = D ** -0.5
++
++
++def t(fn, name, ref=None):
++    out = fn()
++    torch.xpu.synchronize()
++    t0 = time.perf_counter()
++    for _ in range(a.iters):
++        out = fn()
++    torch.xpu.synchronize()
++    ms = (time.perf_counter() - t0) / a.iters * 1e3
++    d = "" if ref is None else f"  max|diff| vs union {(out.float() - ref.float()).abs().max().item():.4f}"
++    print(f"{name:34s} {ms:8.1f} ms{d}", flush=True)
++    return out
++
++
++ref = t(lambda: qsa_xpu.qsa_sparse_attention_union(q, k_cache, v_cache, slots, scale), "union (current)")
++
++
++def sdpa_mask(block=2048):
++    """Fused SDPA over the union of selected slots with a boolean mask, GQA by head expansion, row blocks."""
++    valid = slots >= 0
++    uni = torch.unique(slots[valid])
++    nu = int(uni.numel())
++    col = torch.where(valid, torch.searchsorted(uni, slots.clamp_min(0).to(uni.dtype)),
++                      torch.full_like(slots, nu, dtype=torch.long))
++    kk = k_cache.index_select(0, uni.long()).to(torch.bfloat16).transpose(0, 1)       # [Hk, nu, D]
++    vv = v_cache.index_select(0, uni.long()).to(torch.bfloat16).transpose(0, 1)
++    out = torch.empty_like(q)
++    for r0 in range(0, R, block):
++        r1 = min(R, r0 + block)
++        n = r1 - r0
++        mask = torch.zeros((n, nu + 1), dtype=torch.bool, device=dev)
++        mask.scatter_(1, col[r0:r1].long(), True)
++        qq = q[r0:r1].transpose(0, 1).unsqueeze(0)                                       # [1, Hq, n, D]
++        o = torch.nn.functional.scaled_dot_product_attention(
++            qq, kk.unsqueeze(0), vv.unsqueeze(0), attn_mask=mask[:, :nu].view(1, 1, n, nu), scale=scale,
++            enable_gqa=True)
++        out[r0:r1] = o[0].transpose(0, 1)
++    return out
++
++
++t(lambda: qsa_xpu.qsa_sparse_attention(q, k_cache, v_cache, slots, scale), "plugin qsa_sparse_attention", ref)
++for blk in (1024, 4096):
++    try:
++        t(lambda: sdpa_mask(blk), f"sdpa bool-mask, rows/{blk}", ref)
++    except Exception as e:
++        print(f"sdpa bool-mask rows/{blk}: failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+diff --git c/xpu/tests/bench_qsa_select.py i/xpu/tests/bench_qsa_select.py
+new file mode 100644
+index 0000000..1ecfb3e
+--- /dev/null
++++ i/xpu/tests/bench_qsa_select.py
+@@ -0,0 +1,109 @@
++"""
++QSA prefill token selection on the B70 (QSAIndexer.select_prefill_tokens), step by step, against faster versions:
++  - MQA logits: SGLang's torch fallback (fp32 einsum into [rows, keys, heads]) vs per-head fp32 GEMMs
++  - top-k: the plugin's qsa_fast_topk
++  - block -> token expansion: SGLang's torch fallback (stable argsort per row) vs its Triton kernel (CUDA-only in
++    SGLang) vs a sort-free scatter
++Synthetic data at Qwen3.8-Flash-Next shapes (4 index heads x 128, compress ratio 4, 2048 selected tokens).
++
++  python3 tests/bench_qsa_select.py --rows 8192 --keys 16384
++"""
++import argparse
++import os
++import sys
++import time
++
++import torch
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, ".."))
++from exl3xpu import qsa_xpu  # noqa: E402
++from sglang.srt.layers.attention.qsa import kernel as K  # noqa: E402
++from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_prefill  # noqa: E402
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--rows", type=int, default=8192)
++ap.add_argument("--keys", type=int, default=16384)
++ap.add_argument("--iters", type=int, default=3)
++a = ap.parse_args()
++dev = torch.device("xpu", 0)
++H, D, RATIO, TOKEN_TOPK = 4, 128, 4, 2048
++BLOCK_TOPK = TOKEN_TOPK // RATIO
++R, L = a.rows, a.keys
++C = L // RATIO
++g = torch.Generator(device="cpu").manual_seed(0)
++q = (torch.randn((R, H, D), generator=g)).to(torch.bfloat16).to(dev)
++k = (torch.randn((C, 1, D), generator=g)).to(torch.bfloat16).to(dev)
++pos = torch.arange(L - R, L, device=dev)
++row_starts = torch.zeros(R, dtype=torch.int32, device=dev)
++row_ends = ((pos + 1) // RATIO).to(torch.int32)
++seq_lens = torch.full((R,), L, dtype=torch.int32, device=dev)
++
++
++def t(fn, name):
++    out = fn()
++    torch.xpu.synchronize()
++    t0 = time.perf_counter()
++    for _ in range(a.iters):
++        out = fn()
++    torch.xpu.synchronize()
++    print(f"{name:40s} {(time.perf_counter() - t0) / a.iters * 1e3:8.1f} ms", flush=True)
++    return out
++
++
++def mqa_gemm(q, k, row_starts, row_ends):
++    kf = k[:, 0].float().t()                                   # [D, C]
++    logits = torch.relu(q[:, 0].float() @ kf)
++    for h in range(1, q.shape[1]):
++        logits.add_(torch.relu(q[:, h].float() @ kf))
++    logits.div_(q.shape[-1] ** 0.5)
++    cols = torch.arange(k.shape[0], device=q.device).unsqueeze(0)
++    valid = (cols >= row_starts.reshape(-1, 1)) & (cols < row_ends.reshape(-1, 1))
++    return logits.masked_fill_(~valid, -float("inf"))
++
++
++ref = t(lambda: torch_qsa_mqa_prefill(q, k, row_starts, row_ends), "mqa: torch fallback (einsum)")
++new = t(lambda: mqa_gemm(q, k, row_starts, row_ends), "mqa: per-head fp32 GEMM")
++fin = torch.isfinite(ref)
++print(f"   max|diff| {(ref[fin] - new[fin]).abs().max().item():.2e}, same -inf mask {torch.equal(fin, torch.isfinite(new))}")
++blocks = t(lambda: qsa_xpu.qsa_fast_topk(ref, row_starts, row_ends, BLOCK_TOPK), "top-k (plugin qsa_fast_topk)")
++blocks_new = qsa_xpu.qsa_fast_topk(new, row_starts, row_ends, BLOCK_TOPK)
++same = (blocks.sort(1).values == blocks_new.sort(1).values).all(1).float().mean().item()
++print(f"   rows with the same selected block set from the GEMM logits: {same:.4%}")
++
++
++def expand_scatter(block_indices, query_positions, sequence_lengths, compress_ratio, token_topk):
++    """Sort-free expansion, same output as SGLang's torch version when the valid blocks form a prefix of each row
++    (qsa_fast_topk writes them first): valid tokens first, then the partial tail block, -1 after."""
++    rows, bt = block_indices.shape
++    final = token_topk + compress_ratio - 1
++    dev_ = block_indices.device
++    blocks = block_indices.long()
++    offs = torch.arange(compress_ratio, device=dev_)
++    exp = (blocks.unsqueeze(-1) * compress_ratio + offs).reshape(rows, bt * compress_ratio)[:, :token_topk]
++    ok = (blocks >= 0).unsqueeze(-1).expand(rows, bt, compress_ratio).reshape(rows, -1)[:, :token_topk]
++    ok = ok & (exp < sequence_lengths.long().unsqueeze(1))
++    n_ok = ok.sum(1)                                                          # valid expanded tokens per row
++    vis = query_positions.long() + 1
++    tail_start = vis // compress_ratio * compress_ratio
++    j = torch.arange(compress_ratio - 1, device=dev_).unsqueeze(0)
++    tail = tail_start.unsqueeze(1) + j
++    tail_ok = (j < (vis - tail_start).unsqueeze(1)) & (tail < sequence_lengths.long().unsqueeze(1))
++    out = torch.full((rows, final + 1), -1, dtype=torch.long, device=dev_)
++    dump = torch.full_like(exp, final)
++    col = torch.arange(token_topk, device=dev_).unsqueeze(0).expand(rows, -1)
++    out.scatter_(1, torch.where(ok, col, dump), torch.where(ok, exp, torch.full_like(exp, -1)))
++    out[:, final] = -1
++    tcol = torch.where(tail_ok, n_ok.unsqueeze(1) + j, torch.full_like(tail, final))
++    out.scatter_(1, tcol, torch.where(tail_ok, tail, torch.full_like(tail, -1)))
++    return out[:, :final].to(torch.int32)
++
++
++e_ref = t(lambda: K.torch_expand_qsa_block_indices(blocks, pos, seq_lens, RATIO, TOKEN_TOPK), "expand: torch fallback (argsort)")
++try:
++    e_tri = t(lambda: K.triton_expand_qsa_block_indices(blocks, pos, seq_lens, RATIO, TOKEN_TOPK), "expand: SGLang Triton kernel")
++    print(f"   equal to fallback: {torch.equal(e_ref, e_tri)}")
++except Exception as e:
++    print(f"expand: Triton kernel failed: {type(e).__name__}: {str(e)[:200]}")
++e_sc = t(lambda: expand_scatter(blocks, pos, seq_lens, RATIO, TOKEN_TOPK), "expand: sort-free scatter")
++print(f"   equal to fallback: {torch.equal(e_ref, e_sc)}")
+diff --git c/xpu/tests/bench_staging.py i/xpu/tests/bench_staging.py
+index 83086d5..b7f2c6c 100644
+--- c/xpu/tests/bench_staging.py
++++ i/xpu/tests/bench_staging.py
+@@ -19,10 +19,11 @@ sys.argv = _argv
+ ap2 = argparse.ArgumentParser()
+ ap2.add_argument("--m", default="2048,8192")
+ ap2.add_argument("--layers", type=int, default=6)
++ap2.add_argument("--layer", type=int, default=1, help="checkpoint layer to load (K=3; layer 0 is 4-bit here)")
+ ap2.add_argument("--out", default="")
+ a2 = ap2.parse_args()
+ 
+-host, devarena = load_layer(0)
++host, devarena = load_layer(a2.layer)
+ LB = E * BLOB
+ stage = [torch.empty(LB, dtype=torch.uint8, device=dev) for _ in range(2)]
+ hp = s64(host.data_ptr())
+diff --git c/xpu/tests/probe_kernel_load.py i/xpu/tests/probe_kernel_load.py
+new file mode 100644
+index 0000000..46dc159
+--- /dev/null
++++ i/xpu/tests/probe_kernel_load.py
+@@ -0,0 +1,63 @@
++"""B70 spike: does loading many JIT kernel variants in one process make a later kernel launch fail with
++UR_RESULT_ERROR_OUT_OF_RESOURCES? Runs dense EXL3 linears (K=3/4/5) and grouped MoE (K=3/4) over many row counts on
++random data (values irrelevant), then the n-gram NVMe lookup that failed in serving."""
++import os, sys, time
++import torch
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++t0 = time.time()
++def say(m): print(f"[{time.time() - t0:6.1f}s] {m}", flush=True)
++dev = torch.device("xpu", 0)
++torch.ops.load_library(os.environ["EXL3_LIB"])
++C = torch.ops.exl3xpu_C
++from exl3xpu.moe_offload import ops
++X = ops()
++n_launch = 0
++
++
++def dense(K, k, n, M):
++    global n_launch
++    tr = torch.randint(-32768, 32767, (k // 16, n // 16, 16 * K), dtype=torch.int16, device=dev)
++    suh = (torch.rand((1, k), device=dev) + 0.5).half()
++    svh = (torch.rand(n, device=dev) * 0.01).half()
++    sonb = torch.zeros(n // 128, dtype=torch.int32, device=dev)
++    x = torch.randn((M, k), device=dev).to(torch.bfloat16)
++    C.linear(x, tr, suh, svh, sonb, [0, n], K, 2, 128, 16384)
++    torch.xpu.synchronize()
++    n_launch += 1
++
++
++def moe(K, M):
++    global n_launch
++    H, I, E = 2560, 640, 512
++    blob = int(X.blob_bytes(H, I, K))
++    arena = torch.randint(0, 255, (E, blob), dtype=torch.uint8, device=dev)
++    ptrs = (arena.data_ptr() + torch.arange(E, dtype=torch.int64) * blob).to(dev)
++    x = torch.randn((M, H), device=dev).to(torch.bfloat16)
++    w, ids = torch.topk(torch.softmax(torch.randn((M, E), device=dev), -1), 10, dim=-1)
++    X.moe_forward(x, ids.to(torch.int32).contiguous(), (w / w.sum(-1, keepdim=True)).float().contiguous(), ptrs, I, K, E)
++    torch.xpu.synchronize()
++    n_launch += 1
++
++
++stage = "start"
++try:
++    for K in (3, 4, 5):
++        for (k, n) in ((2560, 1280), (640, 2560)):
++            for M in (1, 4, 23, 129):
++                stage = f"dense K={K} {k}x{n} M={M}"
++                dense(K, k, n, M)
++        say(f"dense K={K} done ({n_launch} calls)")
++    for K in (3, 4):
++        for M in (1, 4, 23, 600):
++            stage = f"moe K={K} M={M}"
++            moe(K, M)
++        say(f"moe K={K} done ({n_launch} calls)")
++    stage = "ngram"
++    from exl3xpu.ngram_nvme import Exl3NgramNvmeTable
++    nv = Exl3NgramNvmeTable(os.environ["MODEL"], ram_gb=4.0, device=dev)
++    ids = torch.randint(0, nv.num_rows, (23, 16), dtype=torch.int64).to(dev)
++    out = nv.gather(ids); torch.xpu.synchronize()
++    say(f"n-gram gather after {n_launch} kernel-variant calls: ok, finite={bool(torch.isfinite(out.float()).all())}")
++except Exception as e:
++    say(f"FAILED at {stage} after {n_launch} calls: {str(e).splitlines()[0]}")
++    sys.exit(1)
+diff --git c/xpu/tests/probe_ngram_nvme.py i/xpu/tests/probe_ngram_nvme.py
+new file mode 100644
+index 0000000..8919304
+--- /dev/null
++++ i/xpu/tests/probe_ngram_nvme.py
+@@ -0,0 +1,34 @@
++"""B70 spike: step-by-step probe of the NVMe n-gram tier (no host table), to find where a lookup stalls."""
++import os, sys, time
++import torch
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++from exl3xpu.ngram_nvme import Exl3NgramNvmeTable
++t0 = time.time()
++def say(m): print(f"[{time.time() - t0:6.1f}s] {m}", flush=True)
++dev = torch.device("xpu", 0)
++held = []
++if os.environ.get("HOLD_GB"):            # pinned host USM like the expert store, allocated first
++    from exl3xpu.moe_offload import ops
++    X = ops()
++    for i in range(int(os.environ["HOLD_GB"])):
++        h = X.host_alloc(1 << 30); h.fill_(1); held.append(h)
++    say(f"holding {len(held)} GiB of host USM")
++if os.environ.get("HOLD_DEV_GB"):        # device memory in use like the serving process (slots, weights, KV)
++    for i in range(int(os.environ["HOLD_DEV_GB"])):
++        held.append(torch.ones(1 << 28, dtype=torch.float32, device=dev))
++    torch.xpu.synchronize(); say(f"holding {os.environ['HOLD_DEV_GB']} GiB of device memory")
++say("constructing the NVMe table")
++nv = Exl3NgramNvmeTable(os.environ["MODEL"], ram_gb=float(os.environ.get("RAM_GB", "1")), device=dev)
++say(f"table ready: {nv.num_rows} rows, K={nv.K}, words={nv.words}")
++ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.int64, device=dev)
++torch.xpu.synchronize(); say("ids on device; calling gather (1 x 16)")
++out = nv.gather(ids)
++say("gather enqueued; synchronizing")
++torch.xpu.synchronize()
++say(f"gather done: {tuple(out.shape)} {out.dtype}, finite={bool(torch.isfinite(out.float()).all())}, absmean={out.float().abs().mean().item():.4f}")
++for T in (25, 4096):
++    g = torch.Generator().manual_seed(T)
++    ids = torch.randint(0, nv.num_rows, (T, 16), generator=g, dtype=torch.int64).to(dev)
++    torch.xpu.synchronize(); say(f"gather {T} x 16 random ids")
++    out = nv.gather(ids); torch.xpu.synchronize()
++    say(f"  done: finite={bool(torch.isfinite(out.float()).all())}, absmean={out.float().abs().mean().item():.4f}")
+diff --git c/xpu/tests/test_dense_bits.py i/xpu/tests/test_dense_bits.py
+new file mode 100644
+index 0000000..6b18d52
+--- /dev/null
++++ i/xpu/tests/test_dense_bits.py
+@@ -0,0 +1,93 @@
++"""
++B70 spike: every (bit width, shape) of the checkpoint's dense EXL3 linears through torch.ops.exl3xpu_C.linear at several
++row counts, against the fp32 reference (trellis_core.reference.weight_orig). Lists launch failures (e.g.
++UR_RESULT_ERROR_OUT_OF_RESOURCES) and accuracy per case. One real tensor per (K, k, n); shared-expert gate+up also fused.
++
++  python3 tests/test_dense_bits.py --model /models/<ckpt> [--m 1,4,8,16,24,64,129,512]
++"""
++import argparse, json, os, re, sys
++import torch
++from safetensors import safe_open
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, "..", "..", "core", "src"))
++sys.path.insert(0, os.path.join(HERE, ".."))
++from trellis_core import reference as ref
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--model", required=True)
++ap.add_argument("--m", default="1,4,8,16,24,64,129,512")
++ap.add_argument("--only-k", default="")
++args = ap.parse_args()
++torch.ops.load_library(os.environ["EXL3_LIB"])
++C = torch.ops.exl3xpu_C
++dev = torch.device("xpu:0")
++idx = json.load(open(f"{args.model}/model.safetensors.index.json"))["weight_map"]
++handles = {}
++
++
++def get(name):
++    fn = idx[name]
++    if fn not in handles:
++        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
++    return handles[fn].get_tensor(name)
++
++
++# one representative per (K, k, n), skipping routed experts, vision and the MTP head
++seen, cases = set(), []
++for name in sorted(idx):
++    if not name.endswith(".trellis") or ".experts." in name or "visual" in name or "mtp" in name:
++        continue
++    base = name[:-len(".trellis")]
++    fn = idx[name]
++    if fn not in handles:
++        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
++    sh = handles[fn].get_slice(name).get_shape()
++    K = sh[2] // 16
++    key = (K, sh[0] * 16, sh[1] * 16)
++    if args.only_k and str(K) not in args.only_k.split(","):
++        continue
++    if key not in seen:
++        seen.add(key)
++        cases.append(([base], key))
++# fused shared-expert gate+up per K (the call that failed in serving)
++for K_want in (3, 4, 5):
++    for name in sorted(idx):
++        m = re.match(r"(.*\.mlp\.shared_expert)\.gate_proj\.trellis$", name)
++        if m and handles.setdefault(idx[name], safe_open(f"{args.model}/{idx[name]}", "pt", device="cpu")).get_slice(name).get_shape()[2] // 16 == K_want:
++            cases.append(([m.group(1) + ".gate_proj", m.group(1) + ".up_proj"], ("fused", K_want)))
++            break
++
++print(f"{len(cases)} cases", flush=True)
++Ms = [int(v) for v in args.m.split(",")]
++fails = 0
++for bases, key in cases:
++    t = [{s: get(b + "." + s) for s in ("trellis", "suh", "svh")} for b in bases]
++    K = t[0]["trellis"].shape[2] // 16
++    tr = torch.cat([x["trellis"] for x in t], 1).contiguous().to(dev) if len(t) > 1 else t[0]["trellis"].contiguous().to(dev)
++    suh = torch.stack([x["suh"].half() for x in t]).contiguous().to(dev)
++    svh = torch.cat([x["svh"].half() for x in t]).contiguous().to(dev)
++    bounds = [0]
++    for x in t:
++        bounds.append(bounds[-1] + x["trellis"].shape[1] * 16)
++    sonb = torch.empty(bounds[-1] // 128, dtype=torch.int32)
++    for g in range(len(bounds) - 1):
++        sonb[bounds[g] // 128: bounds[g + 1] // 128] = g
++    sonb = sonb.to(dev)
++    W = torch.cat([ref.weight_orig(x["trellis"].to(dev), x["suh"].to(dev), x["svh"].to(dev), K, 2) for x in t], 1)
++    kdim = W.shape[0]
++    for M in Ms:
++        x = (torch.randn((M, kdim), generator=torch.Generator().manual_seed(M)) * 0.5).to(torch.bfloat16).to(dev)
++        try:
++            y = C.linear(x, tr, suh, svh, sonb, bounds, K, 2, 128, 16384)
++            torch.xpu.synchronize()
++            r = x.float() @ W
++            rms = ((y.float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
++            status = "ok" if rms < 0.02 else "WRONG"
++            fails += status != "ok"
++            print(f"{str(key):22s} {'+'.join(b.split('.')[-1] for b in bases):18s} M={M:4d} {status} rms_rel={rms:.4f}", flush=True)
++        except Exception as e:
++            fails += 1
++            print(f"{str(key):22s} {'+'.join(b.split('.')[-1] for b in bases):18s} M={M:4d} FAIL {str(e).splitlines()[0][:110]}", flush=True)
++            torch.xpu.synchronize()
++print(f"{len(cases)} shapes x {len(Ms)} row counts, {fails} failures", flush=True)
+diff --git c/xpu/tests/test_moe_k4.py i/xpu/tests/test_moe_k4.py
+new file mode 100644
+index 0000000..91c1a2e
+--- /dev/null
++++ i/xpu/tests/test_moe_k4.py
+@@ -0,0 +1,210 @@
++"""
++K=4 variant of test_moe.py (B70 spike): the expert bit width is read from the checkpoint (layer 0 of
++Lygodactylus/Qwen3.8-Flash-Next-Uncensored-exl3-3bpw is K=4) and blobs are packed by exl3xpu.moe_offload.
++X002: grouped EXL3 MoE (pointer-table experts) on XPU vs the trellis_core fp32 reference, on REAL Qwen3.8-Flash-Next
++routed experts; plus decode/prefill microbenchmarks with experts in device slots / host USM (zero-copy) / mixed.
++
++  python3 tests/test_moe.py --check            # correctness, layers 0 and 47, M = 1..16 (+ prefill sizes if built)
++  python3 tests/test_moe.py --bench-decode     # per-layer latency, device vs host-USM vs mixed
++"""
++import os, sys, json, time, argparse, random
++import torch
++import torch.nn.functional as F
++from safetensors import safe_open
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, "..", "..", "core", "src"))
++sys.path.insert(0, os.path.join(HERE, ".."))
++from trellis_core import reference as ref
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--model", default=os.environ.get("MODEL", "/model"))
++ap.add_argument("--layer", type=int, default=0)
++ap.add_argument("--check", action="store_true")
++ap.add_argument("--check-m", default="1,2,3,4,8,16")
++ap.add_argument("--bench-decode", action="store_true")
++ap.add_argument("--bench-m", default="1,2,4,8,16")
++ap.add_argument("--bench-prefill", action="store_true")
++ap.add_argument("--prefill-m", default="2048,8192")
++ap.add_argument("--iters", type=int, default=100)
++ap.add_argument("--dtype", default="bf16")
++ap.add_argument("--out", default="")
++ap.add_argument("--splits", default="", help="gu_p,dn_p")
++ap.add_argument("--mr", type=int, default=0)
++ap.add_argument("--placements", default="device,host,mixed50,mixed20")
++args = ap.parse_args()
++
++torch.ops.load_library(os.environ.get("EXL3_MOE_LIB") or os.path.join(HERE, "..", "exl3xpu", "_moe.so"))
++X = torch.ops.exl3xpu_moe
++dev = torch.device("xpu:0")
++H, I, E, TOPK = 2560, 640, 512, 10
++from exl3xpu.moe_offload import pack_expert as _pack_expert
++if args.splits:
++    X.moe_set_splits(*[int(v) for v in args.splits.split(",")])
++if args.mr:
++    X.moe_set_mr(args.mr)
++if os.environ.get("MOE_PREFILL_MIN_M"):
++    X.moe_set_prefill_min_m(int(os.environ["MOE_PREFILL_MIN_M"]))
++if os.environ.get("MOE_PAIR_MAX_M"):
++    X.moe_set_pair_max_m(int(os.environ["MOE_PAIR_MAX_M"]))
++if os.environ.get("MOE_DEBUG_SKIP"):
++    X.moe_set_debug(int(os.environ["MOE_DEBUG_SKIP"]))
++dt = torch.bfloat16 if args.dtype == "bf16" else torch.float16
++idx = json.load(open(f"{args.model}/model.safetensors.index.json"))["weight_map"]
++handles = {}
++
++
++def get(name):
++    fn = idx[name]
++    if fn not in handles:
++        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
++    return handles[fn].get_tensor(name)
++
++
++def expert_tensors(L, e):
++    p = f"model.language_model.layers.{L}.mlp.experts.{e}."
++    return {pr: {s: get(p + pr + "." + s) for s in ("trellis", "suh", "svh")} for pr in ("gate_proj", "up_proj", "down_proj")}
++
++
++def pack(t):
++    blob = _pack_expert({k: t["gate_proj"][k] for k in ("trellis", "suh", "svh")},
++                        {k: t["up_proj"][k] for k in ("trellis", "suh", "svh")},
++                        {k: t["down_proj"][k] for k in ("trellis", "suh", "svh")}, K)
++    assert blob.numel() == BLOB, (blob.numel(), BLOB)
++    return blob
++
++
++def s64(p):
++    return p - (1 << 64) if p >= (1 << 63) else p
++
++
++K = expert_tensors(args.layer, 0)["gate_proj"]["trellis"].shape[2] // 16
++BLOB = X.blob_bytes(H, I, K)
++print(f"layer {args.layer}: experts K={K}, blob {BLOB} B", flush=True)
++
++
++def load_layer(L):
++    t0 = time.time()
++    host = X.host_alloc(E * BLOB).view(E, BLOB)          # USM host (zero-copy readable by the device)
++    for e in range(E):
++        host[e].copy_(pack(expert_tensors(L, e)))
++    devarena = host.to(dev)                               # device slots [E, BLOB]
++    print(f"layer {L}: packed {E} experts ({E * BLOB / 1e9:.3f} GB) in {time.time() - t0:.1f}s; "
++          f"usm_kind host={X.usm_kind(s64(host.data_ptr()))} dev={X.usm_kind(s64(devarena.data_ptr()))}", flush=True)
++    return host, devarena
++
++
++def ptr_table(host, devarena, on_host_mask):
++    hp = s64(host.data_ptr()) + torch.arange(E, dtype=torch.int64) * BLOB
++    dp = s64(devarena.data_ptr()) + torch.arange(E, dtype=torch.int64) * BLOB
++    return torch.where(on_host_mask, hp, dp).to(dev)
++
++
++def ref_moe(x, ids, w, L, cache):
++    """fp32 reference: dense original-basis weights (trellis_core.reference.weight_orig), grouped by expert."""
++    out = torch.zeros((x.shape[0], H), dtype=torch.float32, device=dev)
++    xf = x.float()
++    flat = ids.flatten().long()
++    for e in torch.unique(flat).tolist():
++        if e not in cache:
++            t = {pr: {s_: v.to(dev) for s_, v in d.items()} for pr, d in expert_tensors(L, e).items()}
++            cache[e] = {pr: ref.weight_orig(t[pr]["trellis"], t[pr]["suh"], t[pr]["svh"], K, 2) for pr in t}
++        W = cache[e]
++        pos = (flat == e).nonzero().flatten()
++        rows, ks = pos // ids.shape[1], pos % ids.shape[1]
++        xs = xf[rows.to(dev)]
++        a = F.silu(xs @ W["gate_proj"]) * (xs @ W["up_proj"])
++        d = a @ W["down_proj"]
++        out.index_add_(0, rows.to(dev), d * w[rows, ks].to(dev).unsqueeze(1))
++    return out
++
++
++def routing(M, g=None, skew=None):
++    g = g or torch.Generator().manual_seed(0)
++    logits = torch.randn((M, E), generator=g)
++    if skew is not None:
++        logits = logits + skew
++    w, ids = torch.topk(torch.softmax(logits, -1), TOPK, dim=-1)
++    w = w / w.sum(-1, keepdim=True)
++    return ids.to(torch.int32).to(dev), w.float().to(dev)
++
++
++res = {"check": [], "decode": [], "prefill": []}
++host, devarena = load_layer(args.layer)
++
++if args.check:
++    cache = {}
++    torch.manual_seed(0)
++    for M in [int(v) for v in args.check_m.split(",")]:
++        for placement in ("device", "host", "mixed"):
++            mask = {"device": torch.zeros(E, dtype=torch.bool), "host": torch.ones(E, dtype=torch.bool),
++                    "mixed": torch.arange(E) % 2 == 1}[placement]
++            ptrs = ptr_table(host, devarena, mask)
++            x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
++            ids, w = routing(M, torch.Generator().manual_seed(M))
++            y = X.moe_forward(x, ids, w, ptrs, I, K, E)
++            y2 = X.moe_forward(x, ids, w, ptrs, I, K, E)
++            torch.xpu.synchronize()
++            r = ref_moe(x, ids.cpu(), w.cpu(), args.layer, cache)
++            err = ((y.float() - r).abs().max() / r.abs().max()).item()
++            rms = ((y.float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
++            det = torch.equal(y, y2)
++            floor = ((r.to(dt).float() - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
++            rec = {"M": M, "placement": placement, "max_rel": round(err, 5), "rms_rel": round(rms, 5),
++                   "rms_rel_floor_out_dtype": round(floor, 5), "deterministic": det}
++            res["check"].append(rec)
++            print(rec, flush=True)
++
++if args.bench_decode:
++    def bench(fn_list, iters):
++        for f in fn_list[:5]:
++            f()
++        torch.xpu.synchronize()
++        t = time.perf_counter()
++        for i in range(iters):
++            fn_list[i % len(fn_list)]()
++        torch.xpu.synchronize()
++        return (time.perf_counter() - t) / iters * 1e6
++
++    for M in [int(v) for v in args.bench_m.split(",")]:
++        x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
++        routs = [routing(M, torch.Generator().manual_seed(1000 + i)) for i in range(64)]
++        for placement, frac in [(p, {"device": 0.0, "host": 1.0, "mixed50": 0.5, "mixed20": 0.2}[p])
++                                for p in args.placements.split(",")]:
++            mask = torch.rand(E, generator=torch.Generator().manual_seed(7)) < frac
++            ptrs = ptr_table(host, devarena, mask)
++            fns = [lambda ids=ids, w=w: X.moe_forward(x, ids, w, ptrs, I, K, E) for ids, w in routs]
++            us = bench(fns, args.iters)
++            n_unique = sum(len(torch.unique(ids)) for ids, _ in routs) / len(routs)
++            gb = n_unique * BLOB / 1e9
++            rec = {"M": M, "placement": placement, "us_per_layer": round(us, 1), "unique_experts": n_unique,
++                   "weight_GBps": round(gb / (us * 1e-6), 1), "ms_48_layers": round(us * 48 / 1e3, 2)}
++            res["decode"].append(rec)
++            print(rec, flush=True)
++
++if args.bench_prefill:
++    for M in [int(v) for v in args.prefill_m.split(",")]:
++        x = (torch.randn((M, H), device=dev) * 0.5).to(dt)
++        routs = [routing(M, torch.Generator().manual_seed(2000 + i)) for i in range(4)]
++        for placement in args.placements.split(","):
++            frac = {"device": 0.0, "host": 1.0, "mixed50": 0.5, "mixed20": 0.2}[placement]
++            mask = torch.rand(E, generator=torch.Generator().manual_seed(7)) < frac
++            ptrs = ptr_table(host, devarena, mask)
++            for ids, w in routs[:2]:
++                X.moe_forward(x, ids, w, ptrs, I, K, E)
++            torch.xpu.synchronize()
++            it = max(3, min(20, int(2e5 / M))) if placement == "device" else 3
++            t = time.perf_counter()
++            for i in range(it):
++                ids, w = routs[i % len(routs)]
++                X.moe_forward(x, ids, w, ptrs, I, K, E)
++            torch.xpu.synchronize()
++            ms = (time.perf_counter() - t) / it * 1e3
++            flops = M * TOPK * 3 * 2 * H * I
++            rec = {"M": M, "placement": placement, "ms_per_layer": round(ms, 3), "TFLOPS": round(flops / ms / 1e9, 1),
++                   "tok_per_s_48_layers_moe_only": round(M / (ms * 48 / 1e3), 0)}
++            res["prefill"].append(rec)
++            print(rec, flush=True)
++
++if args.out:
++    json.dump(res, open(args.out, "w"), indent=1)
+diff --git c/xpu/tests/test_ngram_nvme_k3.py i/xpu/tests/test_ngram_nvme_k3.py
+new file mode 100644
+index 0000000..5587a32
+--- /dev/null
++++ i/xpu/tests/test_ngram_nvme_k3.py
+@@ -0,0 +1,43 @@
++"""X008: NVMe n-gram tier (XPU publish/wait + RowStore) must return bit-identical rows to the USM-host table, incl. an
++XPU-graph-captured lookup; timings for a decode token and a 4k/16k-token lookup (cold and warm cache)."""
++import os, sys, time, torch
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++from exl3xpu.ngram_host import Exl3NgramHostTable
++from exl3xpu.ngram_nvme import Exl3NgramNvmeTable
++dev = torch.device("xpu", 0)
++M = os.environ.get("MODEL", "/model")
++nv = Exl3NgramNvmeTable(M, ram_gb=float(os.environ.get("RAM_GB", "8")), device=dev)
++ho = Exl3NgramHostTable(M)
++bad = 0
++g = torch.Generator().manual_seed(0)
++for T in (1, 7, 4096):
++    ids = torch.randint(0, nv.num_rows, (T, 16), generator=g, dtype=torch.int64).to(dev)
++    if T == 7:
++        ids[0, 0] = 0; ids[0, 1] = nv.num_rows - 1
++    torch.xpu.synchronize(); t = time.perf_counter()
++    a = nv.gather(ids); torch.xpu.synchronize(); dt = (time.perf_counter() - t) * 1e3
++    b = ho.gather(ids)
++    eq = torch.equal(a.view(torch.int16), b.view(torch.int16)); bad += not eq
++    print(f"T={T}: bit-identical {eq}  nvme gather {dt:.2f} ms (cold rows)", flush=True)
++    torch.xpu.synchronize(); t = time.perf_counter()
++    a2 = nv.gather(ids); torch.xpu.synchronize(); dt2 = (time.perf_counter() - t) * 1e3
++    bad += not torch.equal(a2.view(torch.int16), b.view(torch.int16))
++    print(f"      warm {dt2:.2f} ms", flush=True)
++# graph capture of a decode lookup
++ids_s = torch.randint(0, nv.num_rows, (1, 16), generator=g, dtype=torch.int64).to(dev)
++out_s = torch.empty((1, 16, 160), dtype=torch.bfloat16, device=dev)
++s = torch.xpu.Stream(); s.wait_stream(torch.xpu.current_stream())
++with torch.xpu.stream(s):
++    nv.gather(ids_s, out=out_s)
++torch.xpu.current_stream().wait_stream(s); torch.xpu.synchronize()
++gr = torch.xpu.XPUGraph()
++with torch.xpu.graph(gr):
++    nv.gather(ids_s, out=out_s)
++for k in range(5):
++    ids_s.copy_(torch.randint(0, nv.num_rows, (1, 16), generator=g, dtype=torch.int64).to(dev))
++    gr.replay(); torch.xpu.synchronize()
++    eq = torch.equal(out_s.view(torch.int16), ho.gather(ids_s).view(torch.int16)); bad += not eq
++    print("graph replay", k, "bit-identical", eq, flush=True)
++print("stats", {k: v for k, v in nv.stats().items() if k in ("lookups", "misses", "lookup_hit_rate", "bytes", "error", "gpu_waits")})
++nv.release()
++sys.exit(bad)
+diff --git c/xpu/tests/test_prefill_staged.py i/xpu/tests/test_prefill_staged.py
+index 49bc3a1..5e703be 100644
+--- c/xpu/tests/test_prefill_staged.py
++++ i/xpu/tests/test_prefill_staged.py
+@@ -6,7 +6,8 @@ from safetensors import safe_open
+ from exl3xpu.moe_offload import ExpertStore, pack_expert
+ H, I, K, E = 2560, 640, 3, 512
+ dev = torch.device("xpu", 0)
+-M_ = "/model"
++M_ = os.environ.get("MODEL", "/model")
++L0 = int(os.environ.get("LAYER0", "0"))   # first checkpoint layer to use (1 where layer 0 is 4-bit)
+ idx = json.load(open(f"{M_}/model.safetensors.index.json"))["weight_map"]
+ hd = {}
+ def get(n):
+@@ -18,7 +19,7 @@ st = ExpertStore(H, I, K, E, 600, dev, max_layers=L)
+ for l in range(L):
+     h = st.add_layer(f"layers.{l}.mlp.experts")
+     for e in range(E):
+-        p = f"model.language_model.layers.{l}.mlp.experts.{e}."
++        p = f"model.language_model.layers.{l + L0}.mlp.experts.{e}."
+         t = {pr: {s: get(p + pr + "." + s) for s in ("trellis", "suh", "svh")} for pr in ("gate_proj", "up_proj", "down_proj")}
+         pack_expert(t["gate_proj"], t["up_proj"], t["down_proj"], K, out=h[e])
+     st.make_resident(f"layers.{l}.mlp.experts", list(range(l, E, 3)))
+diff --git c/xpu/tests/test_static_tier.py i/xpu/tests/test_static_tier.py
+new file mode 100644
+index 0000000..958720b
+--- /dev/null
++++ i/xpu/tests/test_static_tier.py
+@@ -0,0 +1,138 @@
++"""
++B70 spike: the ExpertStore static tier (EXL3_MOE_STATIC) and per-K stores, on real experts of one layer.
++
++A store whose `static` experts sit in pinned device slots (no host copy) must give exactly the output of the plain
++pointer-table MoE over all-host experts, through every path the plugin uses: decode with the LRU cache
++(forward_cached), prefill staging (forward_prefill_staged) and plain forward. Static slots must never be evicted,
++and the host arena must hold only the non-static experts.
++
++  python3 tests/test_static_tier.py --model /models/<ckpt> --layer 1 --static 150 --slots 200
++  python3 tests/test_static_tier.py --model /models/<ckpt> --layer 0 --all-static        # a K=4 layer
++"""
++import argparse, json, os, sys
++import torch
++from safetensors import safe_open
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, ".."))
++from exl3xpu.moe_offload import ExpertStore, ops, pack_expert, s64
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--model", required=True)
++ap.add_argument("--layer", type=int, default=1)
++ap.add_argument("--static", type=int, default=150)
++ap.add_argument("--slots", type=int, default=200)
++ap.add_argument("--all-static", action="store_true")
++ap.add_argument("--steps", type=int, default=24)
++args = ap.parse_args()
++
++dev = torch.device("xpu:0")
++H, I, E, TOPK = 2560, 640, 512, 10
++idx = json.load(open(f"{args.model}/model.safetensors.index.json"))["weight_map"]
++handles = {}
++
++
++def get(name):
++    fn = idx[name]
++    if fn not in handles:
++        handles[fn] = safe_open(f"{args.model}/{fn}", "pt", device="cpu")
++    return handles[fn].get_tensor(name)
++
++
++def expert(e):
++    p = f"model.language_model.layers.{args.layer}.mlp.experts.{e}."
++    return [{s: get(p + pr + "." + s) for s in ("trellis", "suh", "svh")} for pr in ("gate_proj", "up_proj", "down_proj")]
++
++
++K = expert(0)[0]["trellis"].shape[2] // 16
++X = ops()
++BLOB = int(X.blob_bytes(H, I, K))
++n_static = E if args.all_static else args.static
++n_slots = E if args.all_static else args.slots
++print(f"layer {args.layer}: K={K}, blob {BLOB} B, {n_static} static, {n_slots} slots", flush=True)
++
++# reference: every expert in host USM, plain pointer table
++ref_host = X.host_alloc(E * BLOB).view(E, BLOB)
++for e in range(E):
++    pack_expert(*expert(e), K, out=ref_host[e])
++ref_ptrs = (s64(ref_host.data_ptr()) + torch.arange(E, dtype=torch.int64) * BLOB).to(dev)
++
++# store under test: a pseudo-random static set (not a contiguous range), packed through pack_target/pack_done
++g = torch.Generator().manual_seed(1)
++static = sorted(torch.randperm(E, generator=g)[:n_static].tolist())
++store = ExpertStore(H, I, K, E, n_slots, dev)
++key = f"layers.{args.layer}.mlp.experts"
++store.add_layer(key, static=static)
++for e in range(E):
++    pack_expert(*expert(e), K, out=store.pack_target(key, e))
++    store.pack_done(key, e)
++torch.xpu.synchronize()
++
++ok = True
++
++
++def check(name, cond):
++    global ok
++    ok &= bool(cond)
++    print(("PASS " if cond else "FAIL ") + name, flush=True)
++
++
++check(f"host arena holds only the {E - n_static} non-static experts",
++      store.host[key].shape[0] == E - n_static)
++pinned = store.slot_last.cpu()
++st_slots = [int(store.slot_of[key][e]) for e in static]
++check("every static expert has a pinned slot", all(s >= 0 and int(pinned[s]) == 0x7FFFFFFF for s in st_slots))
++for e in static[:8]:
++    s_ = int(store.slot_of[key][e])
++    if not torch.equal(store.slots[s_].cpu(), ref_host[e]):
++        check(f"static expert {e}: slot bytes equal the packed blob", False)
++        break
++else:
++    check("static experts' slot bytes equal their packed blobs (first 8)", True)
++
++
++def routing(M, seed):
++    gg = torch.Generator().manual_seed(seed)
++    w, ids = torch.topk(torch.softmax(torch.randn((M, E), generator=gg), -1), TOPK, dim=-1)
++    return ids.to(torch.int32).to(dev), (w / w.sum(-1, keepdim=True)).float().to(dev)
++
++
++dt = torch.bfloat16
++same = True
++for step in range(args.steps):                      # decode through the device LRU cache (misses write through)
++    M = 1 + step % 4
++    x = (torch.randn((M, H), generator=torch.Generator().manual_seed(100 + step)) * 0.5).to(dt).to(dev)
++    ids, w = routing(M, 200 + step)
++    y = store.forward_cached(key, x, ids, w)
++    r = X.moe_forward(x, ids, w, ref_ptrs, I, K, E)
++    same &= torch.equal(y, r)
++torch.xpu.synchronize()
++check(f"forward_cached == all-host moe_forward over {args.steps} decode steps (bit-exact)", same)
++pinned = store.slot_last.cpu()
++check("static slots still pinned after the LRU ran", all(int(pinned[s]) == 0x7FFFFFFF for s in st_slots))
++ptrs_now = store.ptrs(key).cpu()
++check("static experts still point at their slots",
++      all(int(ptrs_now[e]) == store.slot_ptr(int(store.slot_of[key][e])) for e in static))
++
++store.reserve_staging()                             # load time: staging sized to the non-static experts only
++st0 = store._stage[0]
++check(f"staging buffer holds E - static = {E - n_static} experts",
++      (st0 is None and n_static == E) or (st0 is not None and st0.shape[0] == E - n_static))
++M = 600                                             # prefill: staging path (copy engine + DPAS)
++x = (torch.randn((M, H), generator=torch.Generator().manual_seed(7)) * 0.5).to(dt).to(dev)
++ids, w = routing(M, 9)
++y = store.forward_prefill_staged(key, x, ids, w)
++r = X.moe_forward(x, ids, w, ref_ptrs, I, K, E)
++torch.xpu.synchronize()
++check(f"forward_prefill_staged == all-host moe_forward at M={M} (bit-exact)", torch.equal(y, r))
++check("prefill staging did not grow the buffer at run time", store._stage[0] is st0)
++
++store.reset_cache()                                 # reset keeps the static tier
++pinned = store.slot_last.cpu()
++check("reset_cache keeps static slots pinned", all(int(pinned[s]) == 0x7FFFFFFF for s in st_slots))
++x = (torch.randn((3, H), generator=torch.Generator().manual_seed(11)) * 0.5).to(dt).to(dev)
++ids, w = routing(3, 12)
++check("forward after reset_cache == reference",
++      torch.equal(store.forward_cached(key, x, ids, w), X.moe_forward(x, ids, w, ref_ptrs, I, K, E)))
++print("ALL PASS" if ok else "SOME FAILED", flush=True)
++sys.exit(0 if ok else 1)

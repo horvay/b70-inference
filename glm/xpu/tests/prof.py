@@ -18,7 +18,7 @@ a = ap.parse_args()
 
 meta = json.load(open(a.store.rsplit(".", 1)[0] + ".json"))
 li_of = {l["key"]: l["li"] for l in meta["layers"]}
-stats = json.load(open("/w/glm-flash-lite/data/stats_own_dec.json"))
+stats = json.load(open("/w/xpu/data/route_stats_glm53.json"))
 order = [(li, e) for _, li, e in sorted(((sc, li_of[k], e) for k, v in stats.items() if k in li_of
                                          for e, sc in enumerate(v)), reverse=True)]
 model, config, cache, tok, tier = load("/models", a.store, cache_size=8192, ram_gb=a.ram_gb, warm=order)

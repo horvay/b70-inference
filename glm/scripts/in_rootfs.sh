@@ -7,11 +7,8 @@
 # Python packages from scripts/setup.sh live in /w/pylib (on PYTHONPATH).
 set -euo pipefail
 W=$(dirname "$(dirname "$(readlink -f "$0")")")
-ROOT=${GLM_B70_ROOTFS:-$W/image/rootfs}
-CONF=${GLM_B70_IMAGE_CONFIG:-$W/scripts/image-config.json}
-if [ ! -d "$ROOT" ] && [ -d "$HOME/work/trellis-b70/image/rootfs" ]; then
-    ROOT=$HOME/work/trellis-b70/image/rootfs      # the original workstation's copy of the same image
-fi
+ROOT=${GLM_B70_ROOTFS:-${B70_ROOTFS:-$(dirname "$W")/state/image/rootfs}}
+CONF=${GLM_B70_IMAGE_CONFIG:-$(dirname "$W")/common/image-config.json}
 MODELS=${GLM53_MODELS:-/mnt/sandisk/glm53/model}
 NVX=${GLM53_NVX:-$HOME/models/glm53-store}
 DEV=(--dev /dev)
@@ -31,7 +28,7 @@ print(env.get("PYTHONPATH", ""))' "$CONF")
 EXTRA=()
 if [ -n "${BWRAP_EXTRA:-}" ]; then eval "EXTRA=($BWRAP_EXTRA)"; fi
 exec bwrap \
-    --overlay-src "$ROOT" --tmp-overlay / \
+    --overlay-src "$(readlink -f "$ROOT")" --tmp-overlay / \
     "${DEV[@]}" \
     --proc /proc \
     --ro-bind /sys /sys \

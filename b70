@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+"""b70: serve large MoE models on an Intel Arc Pro B70 (32 GB) with a RAM tier and an NVMe expert store.
+
+    b70 setup [glm|flashnext|all]          one-time, CPU only: unpack the SGLang XPU image, fetch and build the kernels
+    b70 info <model dir>                   JSON: which family the model is, whether setup and prepare are done
+    b70 prepare <model dir> [--store DIR]  one-time per model: pack the NVMe expert store (GLM; Flash-Next fills its own)
+    b70 serve <model dir> --port N [--ctx N] [--parallel N] [--name NAME] [--store DIR] [--all-ram]
+                                           OpenAI-compatible server in the foreground; SIGTERM stops it
+    b70 stop                               stop a running `b70 serve`
+    b70 status                             JSON: the running server, if any
+
+Families (by config.json model_type):
+  glm        GLM-5.3-Flash EXL3 (glm5_next): glm/ (exllamav3 fork + B70 tier), one request at a time
+  flashnext  Qwen3.8-Flash-Next EXL3 (qwen4_exp): trellis-serve (SGLang 0.5.20-xpu + exl3xpu) with flashnext/'s patch
+
+Everything runs inside the unpacked lmsysorg/sglang XPU image through bubblewrap; no Docker, no root. `serve` is also a
+guard: it stops the server at the first xe fault on the B70, when RAM runs low, or when another GPU job opens the B70.
+
+State lives in B70_STATE (default <repo>/state): the image, per-family overlays, the trellis-serve checkout, caches,
+expert stores, logs. B70_ROOTFS points at an already unpacked image instead; B70_TRELLIS_SRC at a trellis-serve
+checkout to use as is (development).
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+REPO = os.path.dirname(os.path.realpath(__file__))
+STATE = os.path.abspath(os.environ.get("B70_STATE") or os.path.join(REPO, "state"))
+ROOTFS = os.path.realpath(os.environ.get("B70_ROOTFS") or os.path.join(STATE, "image", "rootfs"))
+IMAGE_CONFIG = os.path.join(REPO, "common", "image-config.json")
+# lmsysorg/sglang:v0.5.20-xpu (torch 2.13 XPU, Triton XPU, oneAPI 2026.0 with icpx)
+IMAGE = ("registry-1.docker.io", "lmsysorg/sglang",
+         "sha256:e4e10d66de374e6e8cc88136e8dbfc3182787070df8a48e581fb007cc7a51c36")
+TRELLIS_REPO = "https://github.com/0xSero/trellis-serve.git"
+TRELLIS_COMMIT = "72fd2d4ca8e8de3fce03ab09e3ed1692957c2f8c"     # branch ft-xpu-vision; flashnext/trellis-serve.patch applies here
+TRELLIS = os.path.abspath(os.environ.get("B70_TRELLIS_SRC") or os.path.join(STATE, "trellis-serve"))
+FAMILIES = {"glm5_next": "glm", "qwen4_exp": "flashnext"}
+SERVE_LOCK = os.path.join(STATE, "serve.lock")
+
+
+def say(*a):
+    print("b70:", *a, flush=True)
+
+
+def fail(msg, code=1):
+    print(f"b70: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------------------------------------- models and state
+
+def read_model(model_dir):
+    """(family, config) of an EXL3 model folder, family None when b70 does not serve it."""
+    try:
+        with open(os.path.join(model_dir, "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None, {}
+    q = cfg.get("quantization_config") or {}
+    if q.get("quant_method") != "exl3" and not os.path.exists(os.path.join(model_dir, "quantization_config.json")):
+        return None, cfg
+    return FAMILIES.get(cfg.get("model_type")), cfg
+
+
+def default_store(family):
+    return os.path.join(STATE, "stores", family)
+
+
+def glm_store_ready(store):
+    return os.path.exists(os.path.join(store, "glm53_flash_exl3_experts_blob.json"))
+
+
+def patch_sha():
+    with open(os.path.join(REPO, "flashnext", "trellis-serve.patch"), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
+def setup_marker(family):
+    return os.path.join(STATE, f"setup-{family}.json")
+
+
+def setup_wanted(family):
+    """What a finished setup of `family` must have been built from; a change means setup runs again."""
+    if family == "glm":
+        sub = subprocess.run(["git", "-C", os.path.join(REPO, "glm", "exllamav3"), "rev-parse", "HEAD"],
+                             capture_output=True, text=True)
+        return {"exllamav3": sub.stdout.strip(), "build": file_sha(os.path.join(REPO, "glm", "xpu", "build.sh"))}
+    src = "dev:" + TRELLIS if os.environ.get("B70_TRELLIS_SRC") else f"{TRELLIS_COMMIT}+{patch_sha()}"
+    return {"trellis": src}
+
+
+def file_sha(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def setup_done(family):
+    try:
+        with open(setup_marker(family)) as f:
+            return json.load(f) == setup_wanted(family) and image_ready()
+    except (OSError, ValueError):
+        return False
+
+
+def image_ready():
+    return os.path.isfile(os.path.join(ROOTFS, "opt", "venv", "bin", "python3")) or \
+        os.path.isfile(os.path.join(ROOTFS, "usr", "bin", "python3"))
+
+
+# ------------------------------------------------------------------------------------------------------- sandbox
+
+def image_env():
+    with open(IMAGE_CONFIG) as f:
+        env = dict(e.split("=", 1) for e in json.load(f)["config"].get("Env", []))
+    return env
+
+
+def sandbox(family, cmd, gpu=False, model=None, store=None, env=None, chdir=None, template=None):
+    """The bwrap command line that runs `cmd` in the image for `family`.
+
+    glm: the rootfs under a throw-away overlay, glm/ at /w (its build output, pylib, run/ and cache/ live there).
+    flashnext: the rootfs under a persistent overlay (state/overlay/flashnext: the editable trellis-serve install and
+    oneDNN wheels setup puts there), trellis-serve at /opt/trellis-serve, flashnext/ read-only at /opt/b70."""
+    env = dict(env or {})
+    img = image_env()
+    args = ["bwrap"]
+    if family == "glm":
+        w = os.path.join(REPO, "glm")
+        for d in ("run", "cache"):
+            os.makedirs(os.path.join(w, d), exist_ok=True)
+        args += ["--overlay-src", ROOTFS, "--tmp-overlay", "/"]
+        binds = ["--bind", w, "/w", "--tmpfs", "/root", "--bind", os.path.join(w, "cache"), "/root/.cache"]
+        pp = img.get("PYTHONPATH", "")
+        env.setdefault("PYTHONPATH", "/w/xpu:/w/exllamav3:/w/pylib" + (":" + pp if pp else ""))
+        env.setdefault("TRITON_CACHE_DIR", "/root/.cache/triton")
+        chdir = chdir or "/w"
+    else:
+        up, wk = (os.path.join(STATE, "overlay", family, d) for d in ("upper", "work"))
+        cache, run = os.path.join(STATE, "cache", family), os.path.join(STATE, "run", family)
+        for d in (up, wk, cache, run):
+            os.makedirs(d, exist_ok=True)
+        args += ["--overlay-src", ROOTFS, "--overlay", up, wk, "/"]
+        binds = ["--bind", TRELLIS, "/opt/trellis-serve", "--ro-bind", os.path.join(REPO, "flashnext"), "/opt/b70",
+                 "--bind", run, "/run/b70", "--bind", cache, "/root/.cache"]
+        chdir = chdir or "/opt/trellis-serve/xpu"
+    args += ["--dev-bind", "/dev", "/dev"] if gpu else ["--dev", "/dev"]
+    args += ["--proc", "/proc", "--ro-bind", "/sys", "/sys", "--tmpfs", "/tmp",
+             "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]
+    args += binds
+    if model:
+        args += ["--ro-bind", model, "/models" if family == "glm" else "/model"]
+    if store:
+        args += ["--bind", store, "/nvx"]
+    if template:
+        args += ["--ro-bind", template, "/opt/chat_template.jinja"]
+    args += ["--setenv", "HOME", "/root"]
+    try:
+        tz = open("/etc/localtime", "rb").read().splitlines()[-1].decode()
+        args += ["--setenv", "TZ", tz]
+    except (OSError, IndexError, UnicodeDecodeError):
+        pass
+    for k, v in {**img, **env}.items():
+        args += ["--setenv", k, str(v)]
+    args += ["--unshare-pid", "--die-with-parent", "--chdir", chdir]
+    return args + list(cmd)
+
+
+def run_in(family, cmd, **kw):
+    r = subprocess.run(sandbox(family, cmd, **kw))
+    if r.returncode != 0:
+        fail(f"{family}: `{' '.join(cmd)[:120]}` failed (exit {r.returncode})")
+
+
+# --------------------------------------------------------------------------------------------------------- setup
+
+def setup_image():
+    if image_ready():
+        return
+    if not shutil.which("bwrap"):
+        fail("bubblewrap (bwrap) is not installed; install it with your package manager")
+    say(f"pulling {IMAGE[1]}@{IMAGE[2][:19]} into {ROOTFS} (~25 GB; resumes if interrupted)")
+    os.makedirs(os.path.dirname(ROOTFS), exist_ok=True)
+    r = subprocess.run([sys.executable, os.path.join(REPO, "common", "oci_pull.py"), *IMAGE, ROOTFS])
+    if r.returncode != 0 or not image_ready():
+        fail("pulling the image failed")
+
+
+def setup_glm():
+    if not os.path.isfile(os.path.join(REPO, "glm", "exllamav3", "exllamav3", "__init__.py")):
+        r = subprocess.run(["git", "-C", REPO, "submodule", "update", "--init", "glm/exllamav3"])
+        if r.returncode != 0:
+            fail("glm/exllamav3 is missing and `git submodule update --init` failed")
+    say("glm: installing llguidance and marisa-trie into glm/pylib")
+    run_in("glm", ["pip", "install", "-q", "--no-deps", "--target", "/w/pylib", "llguidance==1.9.1",
+                   "marisa-trie==1.4.1"])
+    say("glm: building the SYCL kernels (a few minutes)")
+    run_in("glm", ["bash", "/w/xpu/build.sh"])
+
+
+def fetch_trellis():
+    if os.environ.get("B70_TRELLIS_SRC"):
+        if not os.path.isdir(os.path.join(TRELLIS, "xpu")):
+            fail(f"B70_TRELLIS_SRC={TRELLIS} is not a trellis-serve checkout")
+        return
+    patch = os.path.join(REPO, "flashnext", "trellis-serve.patch")
+    mark = os.path.join(TRELLIS, ".b70-patch")
+    want = f"{TRELLIS_COMMIT}+{patch_sha()}"
+    if open(mark).read().strip() == want if os.path.exists(mark) else False:
+        return
+    git = lambda *a: subprocess.run(["git", "-C", TRELLIS, *a], check=True)  # noqa: E731
+    if not os.path.isdir(os.path.join(TRELLIS, ".git")):
+        os.makedirs(TRELLIS, exist_ok=True)
+        git("init", "-q")
+        git("remote", "add", "origin", TRELLIS_REPO)
+    say(f"flashnext: fetching trellis-serve {TRELLIS_COMMIT[:12]}")
+    git("fetch", "-q", "--depth", "1", "origin", TRELLIS_COMMIT)
+    git("checkout", "-q", "-f", TRELLIS_COMMIT)
+    git("clean", "-q", "-fdx")
+    git("apply", "--whitespace=nowarn", patch)
+    with open(mark, "w") as f:
+        f.write(want + "\n")
+
+
+FLASHNEXT_BUILD = r"""
+X=/opt/trellis-serve/xpu/exl3xpu
+python3 -c "import sys, torch, sglang; print(sys.version.split()[0], 'torch', torch.__version__, 'sglang', sglang.__version__)"
+pip install -q --no-deps onednn==2026.0.0 onednn-devel==2026.0.0
+cd /opt/trellis-serve/xpu
+EXL3_DNNL_DIR="$(python3 -c 'import sys; print(sys.prefix)')" EXL3_OUT=$X/_C_sgl.so bash scripts/build_ext.sh
+EXL3_MOE_OUT=$X/_moe_sgl.so bash scripts/build_moe.sh
+bash scripts/build_ngram_nvme.sh
+gcc -O2 -shared -fPIC -pthread -o $X/_cold_read.so csrc/cold_read.c
+for f in _C_sgl.so _moe_sgl.so exl3xpu_ngram_nvme.so _cold_read.so; do test -s $X/$f; done
+readelf -d $X/_C_sgl.so | grep -q libdnnl.so || { echo "_C_sgl.so built without oneDNN"; exit 1; }
+pip install -q --no-deps --no-build-isolation -e /opt/trellis-serve/core -e /opt/trellis-serve/xpu
+python3 -c "from importlib.metadata import entry_points as e; \
+assert any(x.name == 'exl3xpu' for x in e(group='sglang.srt.plugins')); print('exl3xpu sglang plugin registered')"
+"""
+
+
+def setup_flashnext():
+    fetch_trellis()
+    say("flashnext: building trellis-serve's kernels and installing the plugin (a few minutes)")
+    run_in("flashnext", ["bash", "-euo", "pipefail", "-c", FLASHNEXT_BUILD])
+
+
+def cmd_setup(a):
+    fams = ["glm", "flashnext"] if a.family == "all" else [a.family]
+    setup_image()
+    for fam in fams:
+        if setup_done(fam) and not a.force:
+            say(f"{fam}: already set up")
+            continue
+        (setup_glm if fam == "glm" else setup_flashnext)()
+        with open(setup_marker(fam), "w") as f:
+            json.dump(setup_wanted(fam), f)
+        say(f"{fam}: setup done")
+
+
+# ------------------------------------------------------------------------------------------------- info / prepare
+
+def model_info(model_dir, store=None):
+    fam, cfg = read_model(model_dir)
+    info = {"model": os.path.abspath(model_dir), "family": fam, "model_type": cfg.get("model_type")}
+    if fam:
+        store = store or default_store(fam)
+        info.update(setup=setup_done(fam), store=store,
+                    prepared=glm_store_ready(store) if fam == "glm" else True,
+                    parallel_max=1 if fam == "glm" else 8,
+                    context_max=65536 if fam == "glm" else 217088)
+    return info
+
+
+def cmd_info(a):
+    print(json.dumps(model_info(a.model, a.store), indent=1))
+
+
+def make_store_dir(store):
+    if not os.path.isdir(store):
+        os.makedirs(store, exist_ok=True)
+        # btrfs: no copy-on-write or checksums, so O_DIRECT reads work
+        subprocess.run(["chattr", "+C", store], capture_output=True)
+
+
+def cmd_prepare(a):
+    fam, _ = read_model(a.model)
+    if not fam:
+        fail(f"{a.model} is not a model b70 serves")
+    if not setup_done(fam):
+        fail(f"{fam} is not set up; run `b70 setup {fam}` first")
+    store = os.path.abspath(a.store or default_store(fam))
+    if fam != "glm":
+        say("flashnext needs no prepare step: the first load writes its NVMe store")
+        return
+    if glm_store_ready(store) and not a.force:
+        say(f"glm: expert store already packed in {store}")
+        return
+    make_store_dir(store)
+    say(f"glm: packing the routed experts into {store} (~95 GB, reads the whole model)")
+    run_in("glm", ["python3", "/w/xpu/pack_store.py", "pack"], model=os.path.abspath(a.model), store=store)
+
+
+# ----------------------------------------------------------------------------------------------------- the guard
+
+def b70_pci():
+    """PCI address of the first GPU on the xe driver (the B70)."""
+    for r in sorted(os.listdir("/sys/class/drm")):
+        if not r.startswith("renderD"):
+            continue
+        dev = os.path.realpath(f"/sys/class/drm/{r}/device")
+        if os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) == "xe":
+            return os.path.basename(dev), f"/dev/dri/{r}"
+    return None, None
+
+
+def avail_gb():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1048576
+    return 0.0
+
+
+def psi_full():
+    try:
+        with open("/proc/pressure/memory") as f:
+            for line in f:
+                if line.startswith("full"):
+                    return float(line.split()[1].split("=")[1])
+    except OSError:
+        pass
+    return 0.0
+
+
+SHELLS = {"bash", "sh", "zsh", "dash", "fish", "grep", "timeout", "tail"}
+
+
+def other_jobs(pattern, render, skip):
+    """The user's own GPU jobs (command line matches `pattern`) that have the B70's render node open."""
+    if not pattern or not render:
+        return []
+    rx = re.compile(pattern)
+    found = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) in skip:
+            continue
+        try:
+            args = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            comm = open(f"/proc/{pid}/comm").read().strip()
+            if comm in SHELLS or not rx.search(args):
+                continue
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                if os.readlink(f"/proc/{pid}/fd/{fd}") == render:
+                    found.append(f"{pid} {args[:100]}")
+                    break
+        except OSError:
+            continue
+    return found
+
+
+FAULT = re.compile(r"Fault|CAT error|[Hh]ang|[Rr]eset|wedged|Timedout")
+
+
+class Guard:
+    """Runs the server in its own process group and stops the group on an xe fault, low RAM, memory pressure, another
+    GPU job on the B70, or SIGTERM/SIGINT to this process."""
+
+    def __init__(self, ram_start_gb):
+        self.ram_floor = float(os.environ.get("B70_RAM_FLOOR_GB", "4"))
+        self.psi_max = float(os.environ.get("B70_PSI_MAX", "40"))
+        self.ram_start = float(os.environ.get("B70_RAM_START_GB", ram_start_gb))
+        self.jobs = os.environ.get("B70_OTHER_JOBS", r"sd-cli|main\.py --listen|llama-server|ComfyUI")
+        self.pci, self.render = b70_pci()
+        self.proc = None
+        self.reason = None
+        self.lock = threading.Lock()
+
+    def check_start(self):
+        if not self.pci:
+            fail("no GPU on the xe driver found (the B70 needs the xe kernel driver)")
+        a = avail_gb()
+        if a < self.ram_start:
+            fail(f"GUARD: not starting, only {a:.0f} GB RAM available (need {self.ram_start:.0f})", 98)
+        o = other_jobs(self.jobs, self.render, {os.getpid()})
+        if o:
+            fail(f"GUARD: not starting, another GPU job is using the B70: {o[0]}", 98)
+
+    def stop(self, reason):
+        with self.lock:
+            if self.reason or not self.proc or self.proc.poll() is not None:
+                return
+            self.reason = reason
+        print(f"GUARD: {reason}, stopping the server", flush=True)
+        try:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        for _ in range(80):
+            if self.proc.poll() is not None:
+                return
+            time.sleep(0.1)
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def watch_kernel(self, t0):
+        try:
+            j = subprocess.Popen(["journalctl", "-k", "-f", "-n", "0", "--since", f"@{int(t0)}", "-o", "short-unix",
+                                  "--no-pager"], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            return
+        tag = f"xe {self.pci}"
+        for line in j.stdout:
+            try:
+                if float(line.split()[0]) < t0:
+                    continue
+            except (ValueError, IndexError):
+                pass
+            if tag in line and FAULT.search(line):
+                self.stop(f"B70 fault in the kernel log: {line.strip()[:200]}")
+            if self.proc.poll() is not None:
+                break
+        j.kill()
+
+    def watch_memory(self):
+        seen = 0
+        while self.proc.poll() is None and not self.reason:
+            a, p = avail_gb(), psi_full()
+            if a < self.ram_floor:
+                self.stop(f"RAM low ({a:.1f} GB available, floor {self.ram_floor:.0f})")
+            elif p > self.psi_max:
+                self.stop(f"memory pressure {p:.0f}% (full avg10, max {self.psi_max:.0f}), {a:.1f} GB RAM available")
+            o = other_jobs(self.jobs, self.render, {os.getpid(), self.proc.pid})
+            seen = seen + 1 if o else 0
+            if seen >= 3:      # 3 s in a row: a starting job has opened its card by then
+                self.stop(f"another GPU job started on the B70: {o[0]}")
+            time.sleep(1)
+
+    def run(self, args, warmup=None):
+        t0 = time.time()
+
+        def child():
+            os.setsid()
+            try:
+                with open("/proc/self/oom_score_adj", "w") as f:
+                    f.write("1000")       # the kernel OOM killer takes the server before anything of the user's
+            except OSError:
+                pass
+
+        self.proc = subprocess.Popen(args, preexec_fn=child)
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(s, lambda *_: threading.Thread(target=self.stop, args=("asked to stop",)).start())
+        threading.Thread(target=self.watch_kernel, args=(t0,), daemon=True).start()
+        threading.Thread(target=self.watch_memory, daemon=True).start()
+        if warmup:
+            threading.Thread(target=warmup, daemon=True).start()
+        while True:
+            try:
+                rc = self.proc.wait()
+                break
+            except InterruptedError:
+                continue
+        if self.reason and self.reason != "asked to stop":
+            print(f"GUARD tripped: {self.reason}", flush=True)
+            return 99
+        return 0 if self.reason == "asked to stop" else rc
+
+
+# --------------------------------------------------------------------------------------------------------- serve
+
+def serve_glm(a, model, store):
+    if not glm_store_ready(store):
+        fail(f"the GLM expert store is not packed in {store}; run `b70 prepare {model}` first")
+    ctx = min(a.ctx or 49152, 65536)
+    env = {"GLM_XPU_RAM_MARGIN": os.environ.get("GLM_XPU_RAM_MARGIN", "0.2")}
+    env.update({k: v for k, v in os.environ.items() if k.startswith(("GLM_XPU_", "GLM_SERVE_"))})
+    cmd = ["python3", "/w/xpu/serve.py", "--host", "127.0.0.1", "--port", str(a.port), "--cache", str(ctx),
+           "--served-name", a.name or "glm-5.3-flash", "--store", "/nvx/glm53_flash_exl3_experts_blob.bin"]
+    if a.ram_gb:
+        cmd += ["--ram-gb", str(a.ram_gb)]
+    if a.chat_template:
+        cmd += ["--chat-template", "/opt/chat_template.jinja"]
+    return sandbox("glm", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template), 40, None
+
+
+def serve_flashnext(a, model, store):
+    users = max(1, min(a.parallel or 1, 8))
+    ctx = min(a.ctx or 204800, 217088)
+    hot = "/opt/b70/hot"
+    env = {
+        "HF_HUB_OFFLINE": "1", "ZE_AFFINITY_MASK": "0",
+        "EXL3_MODEL_PATH": "/model",
+        "EXL3_LIB": "/opt/trellis-serve/xpu/exl3xpu/_C_sgl.so",
+        "EXL3_MOE_LIB": "/opt/trellis-serve/xpu/exl3xpu/_moe_sgl.so",
+        # experts the game-master turns route to most stay pinned in VRAM slots (route_to_hot.py over GM turns:
+        # 94% of held-out decode routings against 39% for a generic profile)
+        "EXL3_MOE_SLOTS": "7600", "EXL3_MOE_CACHE": "1", "EXL3_MOE_STATIC": "1",
+        "EXL3_MOE_HOT": f"{hot}/{a.hot or 'gm-7500'}.json",
+        # n-gram embedding table on NVMe behind a small RAM cache; give up on a late row after 1.5 s (xe resets a
+        # compute job after 5 s)
+        "EXL3_NGRAM_TIER": "nvme", "SGLANG_EXL3_NGRAM_TIER": "nvme", "SGLANG_EXL3_NGRAM_RAM_GB": "0.5",
+        "SGLANG_EXL3_NGRAM_TIMEOUT_S": "1.5",
+        # cap torch's cache at 90% of the card (decode graphs allocate outside it), log VRAM use, give cached prefill
+        # blocks back before the reply
+        "EXL3_TORCH_MEM_FRACTION": "0.90", "EXL3_MEM_LOG": "30", "EXL3_RELEASE_AFTER_PREFILL": "1",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        # every server process hands freed heap back to the OS after the load (pyhooks/sitecustomize.py)
+        "PYTHONPATH": "/opt/b70/pyhooks", "TRIM_EVERY_S": "300",
+        # SGLang holds back waiting requests that share a prefix; here each prefill streams every non-resident
+        # expert, so concurrent turns must batch into one forward instead
+        "IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD": "1000000000",
+    }
+    if not a.all_ram:
+        # only the experts in the RAM list keep a host copy; the rest live in the NVMe cold store, written on the first
+        # load. Decode never routes to a cold expert, and pays a 0.5-logit margin against RAM ones (GLM's 0.2).
+        env.update({"EXL3_MOE_RAM": f"{hot}/{a.ram_list or 'gm-ram-4500'}.json",
+                    "EXL3_MOE_COLD_STORE": "/nvx/qwen38_cold_experts",
+                    "EXL3_MOE_RAM_MARGIN": str(a.margin if a.margin is not None else 0.5)})
+    env.update({k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "SGLANG_"))})
+    bs, graph_bs = 1, []
+    while bs < users:
+        graph_bs.append(bs)
+        bs *= 2
+    graph_bs.append(users)
+    cmd = ["python3", "-m", "sglang.launch_server", "--model-path", "/model", "--quantization", "exl3",
+           "--trust-remote-code", "--device", "xpu", "--host", "127.0.0.1", "--port", str(a.port),
+           "--served-model-name", a.name or "flashnext-uncensored",
+           "--disable-shared-experts-fusion", "--kv-cache-dtype", "fp8_e4m3", "--context-length", str(ctx),
+           "--mem-fraction-static", "0.785", "--chunked-prefill-size", "8192", "--max-running-requests", str(users),
+           "--dtype", "bfloat16", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder",
+           "--linear-attn-prefill-backend", "intel_xpu", "--linear-attn-decode-backend", "intel_xpu",
+           "--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs),
+           "--max-mamba-cache-size", "12", "--mamba-max-states-per-path", "2", "--max-total-tokens", "217088"]
+    if a.chat_template:
+        cmd += ["--chat-template", "/opt/chat_template.jinja"]
+    make_store_dir(store)
+
+    def warmup():
+        # one ~5K-token prompt once the server answers: the first long prompt after a start pays ~2.5 s of one-time
+        # setup, better before a player waits on it
+        url = f"http://127.0.0.1:{a.port}"
+        for _ in range(300):
+            try:
+                urllib.request.urlopen(f"{url}/v1/models", timeout=2).read()
+                break
+            except OSError:
+                time.sleep(3)
+        else:
+            return
+        with open(os.path.join(REPO, "flashnext", "hot", "warmup_prompt.json")) as f:
+            body = json.load(f)
+        body.update(max_tokens=1, model=a.name or "flashnext-uncensored")
+        try:
+            urllib.request.urlopen(urllib.request.Request(f"{url}/v1/chat/completions", json.dumps(body).encode(),
+                                                          {"Content-Type": "application/json"}), timeout=300).read()
+            say("warm-up prompt done")
+        except OSError:
+            pass
+
+    return (sandbox("flashnext", cmd, gpu=True, model=model, store=store, env=env, template=a.chat_template),
+            45 if a.all_ram else 25, warmup)
+
+
+def cmd_serve(a):
+    model = os.path.abspath(a.model)
+    fam, _ = read_model(model)
+    if not fam:
+        fail(f"{model} is not a model b70 serves (GLM-5.3-Flash or Qwen3.8-Flash-Next EXL3)")
+    if not setup_done(fam):
+        fail(f"{fam} is not set up; run `b70 setup {fam}` first")
+    store = os.path.abspath(a.store or default_store(fam))
+    if a.chat_template:
+        a.chat_template = os.path.abspath(a.chat_template)
+    os.makedirs(STATE, exist_ok=True)
+    lock = open(SERVE_LOCK, "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("another `b70 serve` is running (one model fits on the B70 at a time); `b70 stop` stops it")
+    lock.seek(0)
+    lock.truncate()
+    json.dump({"pid": os.getpid(), "port": a.port, "model": model, "family": fam}, lock)
+    lock.flush()
+    args, ram_start, warmup = (serve_glm if fam == "glm" else serve_flashnext)(a, model, store)
+    guard = Guard(ram_start)
+    guard.check_start()
+    say(f"serving {os.path.basename(model)} ({fam}) on http://127.0.0.1:{a.port}/v1")
+    if a.dry_run:
+        print(shlex.join(args))
+        return
+    sys.exit(guard.run(args, warmup))
+
+
+def running_server():
+    try:
+        with open(SERVE_LOCK) as f:
+            info = json.load(f)
+        os.kill(info["pid"], 0)
+    except (OSError, ValueError, KeyError):
+        return None
+    try:   # held lock = alive server; a stale file from a killed one is free
+        with open(SERVE_LOCK) as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return None
+    except BlockingIOError:
+        return info
+
+
+def cmd_status(_):
+    print(json.dumps({"running": running_server()}, indent=1))
+
+
+def cmd_stop(_):
+    info = running_server()
+    if not info:
+        say("not running")
+        return
+    os.kill(info["pid"], signal.SIGTERM)
+    for _ in range(150):
+        if not running_server():
+            say("stopped")
+            return
+        time.sleep(0.2)
+    os.kill(info["pid"], signal.SIGKILL)
+    say("killed")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="b70", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("setup")
+    p.add_argument("family", nargs="?", default="all", choices=["all", "glm", "flashnext"])
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_setup)
+    p = sub.add_parser("info")
+    p.add_argument("model")
+    p.add_argument("--store")
+    p.set_defaults(fn=cmd_info)
+    p = sub.add_parser("prepare")
+    p.add_argument("model")
+    p.add_argument("--store")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_prepare)
+    p = sub.add_parser("serve")
+    p.add_argument("model")
+    p.add_argument("--port", type=int, required=True)
+    p.add_argument("--ctx", type=int, help="context length in tokens")
+    p.add_argument("--parallel", type=int, help="requests at once (flashnext; GLM serves one)")
+    p.add_argument("--name", help="model name the API answers to")
+    p.add_argument("--store", help="NVMe expert store directory")
+    p.add_argument("--all-ram", action="store_true", help="flashnext: every non-VRAM expert in RAM (~33 GB) instead "
+                                                          "of the RAM list + NVMe cold store (~15 GB)")
+    p.add_argument("--ram-list", help="flashnext: RAM list in flashnext/hot/ (default gm-ram-4500)")
+    p.add_argument("--hot", help="flashnext: VRAM list in flashnext/hot/ (default gm-7500)")
+    p.add_argument("--margin", type=float, help="flashnext: decode router margin against RAM experts (default 0.5)")
+    p.add_argument("--ram-gb", type=float, help="glm: RAM tier size in GB (default 27)")
+    p.add_argument("--chat-template", help="Jinja chat template to serve with instead of the model's own")
+    p.add_argument("--dry-run", action="store_true", help="print the sandbox command instead of running it")
+    p.set_defaults(fn=cmd_serve)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("stop").set_defaults(fn=cmd_stop)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

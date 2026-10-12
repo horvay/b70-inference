@@ -14,7 +14,7 @@ ap.add_argument("--store", default="/nvx/glm53_flash_exl3_experts_blob.bin")
 ap.add_argument("--tokens", type=int, default=200)
 ap.add_argument("--ram-gb", type=float, default=20.0)
 ap.add_argument("--cache", type=int, default=16384)
-ap.add_argument("--warm", default="/w/glm-flash-lite/data/stats_own_dec.json")
+ap.add_argument("--warm", default="/w/xpu/data/route_stats_glm53.json")
 a = ap.parse_args()
 
 meta = json.load(open(a.store.rsplit(".", 1)[0] + ".json"))
