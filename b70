@@ -750,7 +750,12 @@ def serve_flashnext(a, model, store):
            "--allow-auto-truncate",
            "--linear-attn-prefill-backend", "intel_xpu", "--linear-attn-decode-backend", "intel_xpu",
            "--cuda-graph-backend-decode", "full", "--cuda-graph-bs-decode", *map(str, graph_bs),
-           "--max-mamba-cache-size", "12", "--mamba-max-states-per-path", "2", "--max-total-tokens", "217088"]
+           # linear-attention state slots, in bf16 (~57 MB each; fp32 doubled them and halved the full-attention pool
+           # at 4 games; greedy replies differ from fp32 no more than fp32 runs differ from each other): a running
+           # request takes 5, and each game's cached prompt keeps up to 2 (12 capped any --parallel at 2 running games)
+           "--max-mamba-cache-size", str(max(12, 8 * users)), "--mamba-max-states-per-path", "2",
+           "--mamba-ssm-dtype", "bfloat16", "--max-total-tokens", "217088"]
+    cmd += shlex.split(os.environ.get("B70_SGLANG_ARGS", ""))       # experiments: any other SGLang option
     if a.chat_template:
         cmd += ["--chat-template", "/opt/chat_template.jinja"]
     make_store_dir(store)

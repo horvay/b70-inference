@@ -9,7 +9,8 @@
 |---|---|
 | Decode, 1 user, short game-master turn | 41.7 tok/s |
 | Decode, 1 user, at 18K context | 36.7 tok/s |
-| Decode, 2 / 4 users | 68 / ~50 tok/s total |
+| Decode, 2 / 4 users | 60-68 / 89-100 tok/s total (22-25 each with 4) |
+| Next turn over a cached 21K prompt, four games taking turns | 0.2-0.8 s to the first token |
 | 18K-token prompt (cold) | 15.9 s, ~1,130 tok/s (all experts in RAM: ~13 s) |
 | 3K-token prompt | ~1.2 s; 0.5 s with a cached system prompt |
 | Host RAM | ~15 GB (all experts in RAM: ~33 GB) |
@@ -66,6 +67,13 @@ kernel work below; VRAM already covers ~94% of decode routings, so the margin bu
   prose poorly (accept length ~1.8 of 3).
 - SGLang's in-batch prefix deprioritisation is off: each prefill streams every non-resident expert, so concurrent turns
   sharing a system prompt must batch into one forward (4 users: 28-35 s to first token -> 10-17 s).
+- **Linear-attention state slots scale with `--parallel`.** A running request takes 5 of SGLang's state slots and each
+  cached prompt up to 2; a fixed 12 let only 2 games run at once whatever `--parallel` said (4 games: ~64 tok/s total,
+  two at a time). b70 gives 8 slots a game and stores the states in bf16 (`--mamba-ssm-dtype bfloat16`): in fp32, 28
+  slots took 3 GB and halved the full-attention pool (217K -> 99K tokens). Greedy replies under bf16 states differ from
+  fp32 no more than two fp32 runs differ from each other, and a long-context recall answer was identical. When four
+  turns arrive at the same moment, the fourth can still wait for the other three while earlier prompts' cached states
+  hold the spare slots.
 
 ## Running it
 
