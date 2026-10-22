@@ -9,7 +9,7 @@ import os
 import socket
 import sys
 
-SOCK = os.path.expanduser("~/work/glm-b70/run/dev.sock")
+SOCK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run", "dev.sock")
 args = sys.argv[1:]
 if not args:
     sys.exit(__doc__)

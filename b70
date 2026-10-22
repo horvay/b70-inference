@@ -122,7 +122,9 @@ def setup_wanted(family):
                              capture_output=True, text=True)
         return {"exllamav3": sub.stdout.strip(), "build": file_sha(os.path.join(REPO, "glm", "xpu", "build.sh"))}
     if family == "dsv41":
-        sub = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD:dsv41/exllamav3"], capture_output=True, text=True)
+        # ./ : relative to this folder, which need not be the git repository's root
+        sub = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD:./dsv41/exllamav3"], capture_output=True,
+                             text=True)
         csrc = os.path.join(REPO, "dsv41", "xpu", "csrc")
         kernels = hashlib.sha256()
         for name in sorted(os.listdir(csrc)) if os.path.isdir(csrc) else []:

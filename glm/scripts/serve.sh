@@ -7,7 +7,7 @@
 #   scripts/serve.sh status
 # Port: SERVE_PORT (default 8053). Log: run/serve.log (live speed: run/live.log).
 set -u
-W=$HOME/work/glm-b70
+W=$(dirname "$(dirname "$(readlink -f "$0")")")     # this glm/ folder
 cd "$W"
 PORT=${SERVE_PORT:-8053}
 LOG=run/serve.log

@@ -3,7 +3,7 @@
 # until it is ready. Args go to devserver.py. It starts once the card and RAM_START_GB (30) of RAM are free; the queue
 # stops it after IDLE (15m) idle on the GPU while another job waits.
 set -u
-W=$HOME/work/glm-b70
+W=$(dirname "$(dirname "$(readlink -f "$0")")")     # this glm/ folder
 cd "$W"
 python3 xpu/dev.py --quit >/dev/null 2>&1
 # the previous dev server's ticket, if it is still around (it ends when its server exits)

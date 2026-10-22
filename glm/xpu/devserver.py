@@ -1,7 +1,7 @@
 """Development server: load GLM-5.3-Flash on the B70 once, then run test snippets against the live model.
 
   server:  in_rootfs.sh --gpu python3 /w/xpu/devserver.py [--ram-gb 20]      (socket /w/run/dev.sock)
-  client:  python3 ~/work/glm-b70/xpu/dev.py snippet.py   or   python3 dev.py -c "print(tier.summary())"
+  client:  python3 glm/xpu/dev.py snippet.py   or   python3 dev.py -c "print(tier.summary())"
 
 Each request is Python source executed in a persistent namespace holding model, config, cache, tok, tier, gen, torch,
 and helpers (reload(), decode(n), log). Before each request the glm_xpu kernel modules whose files changed are
@@ -70,7 +70,7 @@ gen = Generator(model=model, cache=cache, tokenizer=tok, max_chunk_size=int(os.e
 from glm_xpu import block_graphs
 block_graphs.install(tier)
 from glm_xpu import live
-live.install(gen, "/w/run/live.log")   # live prefill / decode speed: tail -f ~/work/glm-b70/run/live.log          # decode-step XPU graphs (GLM_XPU_BLOCK_GRAPHS=0 to disable)
+live.install(gen, "/w/run/live.log")   # live prefill / decode speed: tail -f glm/run/live.log          # decode-step XPU graphs (GLM_XPU_BLOCK_GRAPHS=0 to disable)
 
 KMODS = ["glm_xpu.ops", "glm_xpu.k_hc", "glm_xpu.k_kda"]
 _mtime = {}
