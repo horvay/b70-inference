@@ -5,14 +5,18 @@ SSD, including mixture-of-experts models far larger than the card: the experts a
 more sit in pinned RAM, and the rest come from an NVMe store; the router is nudged towards experts that are close by,
 at a measured cost in quality.
 
+The biggest is **DeepSeek-V4.1-Flash-1017** (262B parameters, vcruz305's
+[SAGE EXL3 1.62 bpw pack](https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw)): ~305 GB on disk with its
+Engram tables, nearly ten times the card's memory, at 11-15 tok/s.
+
 | Model | Size | Decode, 1 user | Prompt | Host RAM | Server |
 |---|---|---|---|---|---|
+| **[DeepSeek-V4.1-Flash-1017](dsv41/README.md) 1.62 bpw SAGE EXL3 (262B, the largest)** | ~305 GB (116 GB + 189 GB Engram tables) | ~11-15 tok/s with DSpark | 512 tokens in ~20 s; 40K in ~6 min | ~30 GB | exllamav3 port (`dsv41/`) |
 | [GLM-5.3-Flash](glm/README.md) 2.51 bpw EXL3 | ~105 GB | ~15-18 tok/s | 8K tokens in 14.4 s | ~30 GB | exllamav3 port (`glm/`) |
 | [Qwen3.8-Flash-Next](flashnext/README.md) 3.05 bpw EXL3 | 68 GB | 41.7 tok/s (68 total for 2 users, ~95 for 4) | 18K tokens in 15.9 s | ~15 GB | SGLang + trellis-serve + patch |
-| [DeepSeek-V4.1-Flash](dsv41/README.md) 1.62 bpw SAGE EXL3 | ~305 GB (116 GB + 189 GB Engram tables) | ~11-15 tok/s with DSpark | 512 tokens in ~20 s; 40K in ~6 min | ~30 GB | exllamav3 port (`dsv41/`) |
 | [Gemma 4 31B](gemma/README.md) 4.0 bpw EXL3 (dense) | 17 GB | 36-45 tok/s with its drafter (135 total for 4) | 12K tokens in 6.7 s; context ~46K, ~107K packed | small | SGLang + trellis-serve + patch |
 
-No Docker and no root: both servers run inside an unpacked copy of the `lmsysorg/sglang` XPU image (PyTorch 2.13 XPU,
+No Docker and no root: every server runs inside an unpacked copy of the `lmsysorg/sglang` XPU image (PyTorch 2.13 XPU,
 Triton XPU, oneAPI 2026.0) through bubblewrap.
 
 ## Running it
