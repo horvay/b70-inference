@@ -32,7 +32,7 @@ What the chat server (`scripts/serve.sh`, the default configuration) takes:
 | Resource | Amount |
 |---|---|
 | VRAM | ~30 of 31.9 GiB: 9.0 GiB of non-expert weights with the DSpark drafter, 17.4 GiB expert cache (~17% of the 102 GiB of experts; another ~23% in the RAM tier), 0.7 GiB expert vectors, the rest prompt and verify scratch |
-| RAM | 24 GB pinned expert tier + 2 x 0.5 GB staging areas, plus the Python/torch process; the server starts only with 34 GB free |
+| RAM | ~30 GB measured: 24 GB pinned expert tier, 2 x 0.5 GB staging areas, a 5.2 GB process; the server starts only with 34 GB free |
 | Disk | 116 GiB model folder + 105 GiB expert store (the experts repacked for O_DIRECT reads) on the 990 PRO, 189 GiB of Engram tables on the other two drives: ~410 GiB in all |
 
 ## Quality against the model card
@@ -225,7 +225,9 @@ DeepSeek's golden prompts).
 It runs the tested defaults (DSpark, residency boost 0.3) with a 32K context and a 24 GB RAM tier; ready ~45 s after its
 turn. First measurements (fresh process): 26-token prompt, first token 3-4 s; ~380-token stories at 8.1 tok/s
 (temperature 1.0) and 10.8 tok/s (greedy). Sampling lowers DSpark's acceptance, since a draft must equal the sampled
-token.
+token. Through `b70 serve` as Neverending Quest runs it (2026-10-22): a Game Master request with a dice tool, thinking at
+low effort and NQ's opener prefill reasoned on from the opener and called the tool with valid arguments (400-token prompt,
+first token 22.5 s cold, 12.2 tok/s); with the result it narrated (13.8 tok/s).
 
 ## Open items
 
