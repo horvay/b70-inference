@@ -1,5 +1,8 @@
 # EXL3 models on an Intel Arc Pro B70
 
+> **Moved:** this code now lives in [horvay/b70](https://github.com/horvay/b70) under [`llm/`](https://github.com/horvay/b70/tree/main/llm), with its full history. This repository is kept read-only so pinned commits still install; new work goes to horvay/b70.
+
+
 Serving EXL3 models on one **Intel Arc Pro B70** (Battlemage, 32 GB) in a desktop with 62 GB of RAM and a PCIe 4 NVMe
 SSD, including mixture-of-experts models far larger than the card: the experts a workload uses most stay on the card,
 more sit in pinned RAM, and the rest come from an NVMe store; the router is nudged towards experts that are close by,
