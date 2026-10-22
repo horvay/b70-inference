@@ -1,0 +1,647 @@
+// Glue kernels around the mixed-K MoE GEMVs (dsv_moe.sycl) for DeepSeek-V4.1-Flash decode, so a MoE layer is
+// prep -> gemv(gate|up) -> mid -> gemv(down) -> post instead of ~45 small torch ops.
+//
+// EXL3 linear: y = had(had(x * suh) @ W_hat) * svh, had = blockwise 128-point Sylvester Hadamard / sqrt(128).
+// Expert vectors (per layer, per expert, fp16): suh_g[H] suh_u[H] svh_g[I] svh_u[I] suh_d[I] svh_d[H].
+// A 128-block is held by one sub-group of 16 lanes, 8 consecutive values per lane: butterflies of stride 1, 2, 4 run
+// in registers, strides 8..64 across lanes (xor shuffles).
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+namespace dsvglue {
+
+constexpr int H = 5120, I = 2304;
+constexpr int OFF_SUH_G = 0, OFF_SUH_U = H, OFF_SVH_G = 2 * H, OFF_SVH_U = 2 * H + I, OFF_SUH_D = 2 * H + 2 * I,
+              OFF_SVH_D = 2 * H + 3 * I, VEC = 2 * H + 3 * I + H;
+constexpr float RS = 0.08838834764831845f;     // 1 / sqrt(128)
+
+using sg_t = sycl::sub_group;
+
+static inline void fwht(sg_t& sg, float v[8]) {
+#pragma unroll
+    for (int h = 1; h < 8; h <<= 1) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if ((i & h) == 0) {
+                float a = v[i], b = v[i + h];
+                v[i] = a + b;
+                v[i + h] = a - b;
+            }
+        }
+    }
+    int lane = sg.get_local_linear_id();
+#pragma unroll
+    for (int m = 1; m < 16; m <<= 1) {
+        bool hi = (lane & m) != 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float o = sycl::permute_group_by_xor(sg, v[i], m);
+            v[i] = hi ? o - v[i] : v[i] + o;
+        }
+    }
+}
+
+// prep: items a = 2 * pick + {0: gate, 1: up}; pick p = row * k + j, expert e = ids[p].
+// xh[a][H] fp16 = had(y[row] * suh_{g|u}[e]); wp[a] / kk[a] = gate|up piece pointer / K; wpd[p] / kkd[p] = down's.
+struct Prep {
+    const sycl::half* y; const int64_t* ids; const sycl::half* vec; const int64_t* ptr; const int* Kt;
+    sycl::half* xh; int64_t* wp; int* kk; int64_t* wpd; int* kkd; int k, n;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int w = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int nb = H / 128;
+        int a = w / nb, blk = w % nb;
+        if (a >= 2 * n) return;
+        int p = a >> 1, proj = a & 1, row = p / k;
+        long e = ids[p];
+        const sycl::half* sv = vec + e * VEC + (proj ? OFF_SUH_U : OFF_SUH_G) + blk * 128 + lane * 8;
+        const sycl::half* yr = y + (long)row * H + blk * 128 + lane * 8;
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] = (float)yr[i] * (float)sv[i];
+        fwht(sg, v);
+        sycl::half* o = xh + (long)a * H + blk * 128 + lane * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = (sycl::half)(v[i] * RS);
+        if (blk == 0 && lane == 0) {
+            wp[a] = ptr[e * 3 + proj];
+            kk[a] = Kt[e * 3 + proj];
+            if (proj == 0) { wpd[p] = ptr[e * 3 + 2]; kkd[p] = Kt[e * 3 + 2]; }
+        }
+    }
+};
+
+// mid: per pick p and I-block: g = had(sum_P part[P][2p]) * svh_g, u likewise, a = min(silu(g), L) * clamp(u, -L, L),
+// xd[p][I] fp16 = had(a * suh_d)
+struct Mid {
+    const float* part; const int64_t* ids; const sycl::half* vec; sycl::half* xd; int n, P; float L;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int w = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int nb = I / 128;
+        int p = w / nb, blk = w % nb;
+        if (p >= n) return;
+        long e = ids[p];
+        const sycl::half* ve = vec + e * VEC;
+        int c0 = blk * 128 + lane * 8;
+        float g[8], u[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { g[i] = 0.f; u[i] = 0.f; }
+        for (int q = 0; q < P; ++q) {
+            const float* pg = part + ((long)q * 2 * n + 2 * p) * I + c0;
+            const float* pu = pg + I;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { g[i] += pg[i]; u[i] += pu[i]; }
+        }
+        fwht(sg, g);
+        fwht(sg, u);
+        float a[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float gg = g[i] * RS * (float)ve[OFF_SVH_G + c0 + i];
+            float uu = u[i] * RS * (float)ve[OFF_SVH_U + c0 + i];
+            float s = gg / (1.f + sycl::exp(-gg));
+            if (L > 0.f) { s = sycl::fmin(s, L); uu = sycl::fmin(sycl::fmax(uu, -L), L); }
+            a[i] = s * uu * (float)ve[OFF_SUH_D + c0 + i];
+        }
+        fwht(sg, a);
+        sycl::half* o = xd + (long)p * I + c0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = (sycl::half)(a[i] * RS);
+    }
+};
+
+// post: out[row][H] fp32 = sum_j had(sum_P part2[P][row * k + j]) * svh_d[e] * w[row][j]
+struct Post {
+    const float* part; const int64_t* ids; const float* wts; const sycl::half* vec; float* out; int n, k, R, P;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int w = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int nb = H / 128;
+        int row = w / nb, blk = w % nb;
+        if (row >= R) return;
+        int c0 = blk * 128 + lane * 8;
+        float acc[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+        for (int j = 0; j < k; ++j) {
+            int p = row * k + j;
+            long e = ids[p];
+            float d[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) d[i] = 0.f;
+            for (int q = 0; q < P; ++q) {
+                const float* pd = part + ((long)q * n + p) * H + c0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) d[i] += pd[i];
+            }
+            fwht(sg, d);
+            float ww = wts[p] * RS;
+            const sycl::half* sv = vec + e * VEC + OFF_SVH_D + c0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[i] += d[i] * (float)sv[i] * ww;
+        }
+        float* o = out + (long)row * H + c0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = acc[i];
+    }
+};
+
+// route: per row (one work-group of E threads), s = sqrt(softplus(logit)); picks = top-k of s + bias + res (res: 0 /
+// -margin / -inf residency bias, may be null), want = top-k of s + bias; w = s[picks] normalized * scaling.
+struct Route {
+    const float* logits; const float* bias; const float* res; int64_t* ids; float* w; int64_t* want; int E, k;
+    float scaling; long ls; const float* mul;     // mul: per-expert selection multiplier (residency boost), or null
+    sycl::local_accessor<float, 1> sm;
+    void operator()(sycl::nd_item<1> it) const {
+        int r = it.get_group(0);
+        int t = it.get_local_id(0);
+        auto g = it.get_group();
+        float l = t < E ? logits[(long)r * ls + t] : -1e30f;
+        float sp = l > 20.f ? l : sycl::log1p(sycl::exp(l));
+        float sc = sycl::sqrt(sp);
+        float key0 = t < E ? sc + bias[t] : -3e38f;      // (no infinities: built with -ffast-math)
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass == 1 && !want) break;
+            float key = key0;
+            if (pass == 0 && mul && t < E) key = sc * mul[t] + bias[t];
+            if (pass == 0 && res && t < E) key += sycl::fmax(res[t], -1e30f);
+            float wsum = 0.f;
+            for (int j = 0; j < k; ++j) {
+                // argmax: max value, ties to the lowest index
+                float m = sycl::reduce_over_group(g, key, sycl::maximum<float>());
+                int cand = key == m ? t : 1 << 30;
+                int idx = sycl::reduce_over_group(g, cand, sycl::minimum<int>());
+                if (t == idx) {
+                    if (pass == 0) { ids[(long)r * k + j] = t; sm[j] = sc; }
+                    else want[(long)r * k + j] = t;
+                    key = -3e38f;
+                }
+                sycl::group_barrier(g);
+            }
+            if (pass == 0 && t == 0) {
+                for (int j = 0; j < k; ++j) wsum += sm[j];
+                for (int j = 0; j < k; ++j) w[(long)r * k + j] = sm[j] * scaling / (wsum + 1e-20f);
+            }
+        }
+    }
+};
+
+// Block route (verify blocks): one work-group per job runs its S rows in order. An expert already picked by an earlier
+// row of the block competes with s * mul * (1 + bb) + bias (block boost: the block reads fewer distinct experts); the
+// routing weights stay the plain s. want (optional): the plain top-k (s + bias) per row.
+struct RouteBlock {
+    const float* logits; long ls; const float* bias; const float* mul; int64_t* ids; float* w; int64_t* want;
+    int E, k, S; float scaling, bb;
+    sycl::local_accessor<float, 1> sm; sycl::local_accessor<int, 1> chosen;
+    void operator()(sycl::nd_item<1> it) const {
+        int b = it.get_group(0);
+        int t = it.get_local_id(0);
+        auto g = it.get_group();
+        if (t < E) chosen[t] = 0;
+        sycl::group_barrier(g);
+        for (int si = 0; si < S; ++si) {
+            long r = (long)b * S + si;
+            float l = t < E ? logits[r * ls + t] : -1e30f;
+            float sp = l > 20.f ? l : sycl::log1p(sycl::exp(l));
+            float sc = sycl::sqrt(sp);
+            for (int pass = 0; pass < 2; ++pass) {
+                if (pass == 1 && !want) break;
+                float key = -3e38f;
+                if (t < E) {
+                    key = pass == 0 ? sc * (mul ? mul[t] : 1.f) * (chosen[t] ? 1.f + bb : 1.f) + bias[t] : sc + bias[t];
+                }
+                int mine = -1;
+                for (int j = 0; j < k; ++j) {
+                    float m = sycl::reduce_over_group(g, key, sycl::maximum<float>());
+                    int cand = key == m ? t : 1 << 30;
+                    int idx = sycl::reduce_over_group(g, cand, sycl::minimum<int>());
+                    if (t == idx) {
+                        if (pass == 0) { ids[r * k + j] = t; sm[j] = sc; mine = 1; }
+                        else want[r * k + j] = t;
+                        key = -3e38f;
+                    }
+                    sycl::group_barrier(g);
+                }
+                if (pass == 0 && t == 0) {
+                    float wsum = 0.f;
+                    for (int j = 0; j < k; ++j) wsum += sm[j];
+                    for (int j = 0; j < k; ++j) w[r * k + j] = sm[j] * scaling / (wsum + 1e-20f);
+                }
+                if (pass == 0 && mine > 0) chosen[t] = 1;
+                sycl::group_barrier(g);
+            }
+        }
+    }
+};
+
+static sycl::queue& Q(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+// ------------------------------------------------------------------------------------------------ grouped (multi-row)
+// Several rows (a verify block) share one read of each expert they picked: items are (unique expert, projection) with
+// M = R rows each (rows that did not pick the expert compute zeros; their results are ignored).
+// group: ids [n = R * k] -> uniq [n] (ascending, -1 padded), slot[p] = unique index of pick p, nu[0] = 2 * #unique
+// (gate|up items), nu[1] = #unique (down items).
+struct Group {
+    const int64_t* ids; int64_t* uniq; int* slot; int* nu; int n;
+    void operator()(sycl::nd_item<1> it) const {
+        int p = it.get_local_id(0);
+        bool act = p < n;
+        int64_t e = act ? ids[p] : -1;
+        bool first = act;
+        int rank = 0;
+        for (int q = 0; q < n; ++q) {
+            int64_t f = ids[q];
+            bool fq_first = true;
+            for (int r = 0; r < q; ++r) fq_first = fq_first && ids[r] != f;
+            if (act && q < p && f == e) first = false;
+            if (act && fq_first && f < e) ++rank;
+        }
+        int nfirst = sycl::reduce_over_group(it.get_group(), (int)first, sycl::plus<int>());
+        if (act) {
+            slot[p] = rank;
+            if (first) uniq[rank] = e;
+        }
+        sycl::group_barrier(it.get_group());
+        if (act && p >= nfirst) uniq[p] = -1;
+        if (p == 0) { nu[0] = 2 * nfirst; nu[1] = nfirst; }
+    }
+};
+
+// prep_g: item a = 2u + {gate, up}, row m: xh[a][H/16][M][16] = had(y[m] * suh[e]); wp/kk per item (kk = 0 for padding
+// items: the GEMV skips them), wpd/kkd per unique (down).
+struct PrepG {
+    const sycl::half* y; const int64_t* uniq; const sycl::half* vec; const int64_t* ptr; const int* Kt;
+    sycl::half* xh; int64_t* wp; int* kk; int64_t* wpd; int* kkd; int U, M;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int w = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int nb = H / 128;
+        int a = w / (nb * M), rest = w % (nb * M), m = rest / nb, blk = rest % nb;
+        if (a >= 2 * U) return;
+        int u = a >> 1, proj = a & 1;
+        long e = uniq[u];
+        if (e < 0) {
+            if (blk == 0 && m == 0 && lane == 0) { kk[a] = 0; wp[a] = 0; if (proj == 0) { kkd[u] = 0; wpd[u] = 0; } }
+            return;
+        }
+        const sycl::half* sv = vec + e * VEC + (proj ? OFF_SUH_U : OFF_SUH_G) + blk * 128 + lane * 8;
+        const sycl::half* yr = y + (long)m * H + blk * 128 + lane * 8;
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] = (float)yr[i] * (float)sv[i];
+        fwht(sg, v);
+        // blocked: column c of row m at ((c / 16) * M + m) * 16 + c % 16; this lane's 8 values share c / 16
+        int c = blk * 128 + lane * 8;
+        sycl::half* o = xh + (long)a * H * M + ((long)(c / 16) * M + m) * 16 + c % 16;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = (sycl::half)(v[i] * RS);
+        if (blk == 0 && m == 0 && lane == 0) {
+            wp[a] = ptr[e * 3 + proj];
+            kk[a] = Kt[e * 3 + proj];
+            if (proj == 0) { wpd[u] = ptr[e * 3 + 2]; kkd[u] = Kt[e * 3 + 2]; }
+        }
+    }
+};
+
+// mid_g: per (unique u, row m, I-block): g/u from part [P][2U][M][I], act, xd[u][I/16][M][16] = had(a * suh_d)
+struct MidG {
+    const float* part; const int64_t* uniq; const sycl::half* vec; sycl::half* xd; int U, M, P; float L;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int w = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int nb = I / 128;
+        int u = w / (nb * M), rest = w % (nb * M), m = rest / nb, blk = rest % nb;
+        if (u >= U) return;
+        long e = uniq[u];
+        if (e < 0) return;
+        const sycl::half* ve = vec + e * VEC;
+        int c0 = blk * 128 + lane * 8;
+        float g[8], uu[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { g[i] = 0.f; uu[i] = 0.f; }
+        for (int q = 0; q < P; ++q) {
+            const float* pg = part + (((long)q * 2 * U + 2 * u) * M + m) * I + c0;
+            const float* pu = part + (((long)q * 2 * U + 2 * u + 1) * M + m) * I + c0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { g[i] += pg[i]; uu[i] += pu[i]; }
+        }
+        fwht(sg, g);
+        fwht(sg, uu);
+        float a[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float gg = g[i] * RS * (float)ve[OFF_SVH_G + c0 + i];
+            float vv = uu[i] * RS * (float)ve[OFF_SVH_U + c0 + i];
+            float s_ = gg / (1.f + sycl::exp(-gg));
+            if (L > 0.f) { s_ = sycl::fmin(s_, L); vv = sycl::fmin(sycl::fmax(vv, -L), L); }
+            a[i] = s_ * vv * (float)ve[OFF_SUH_D + c0 + i];
+        }
+        fwht(sg, a);
+        sycl::half* o = xd + (long)u * I * M + ((long)(c0 / 16) * M + m) * 16 + c0 % 16;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = (sycl::half)(a[i] * RS);
+    }
+};
+
+// post_g: out[row][H] = sum_j w[row][j] * had(sum_P part2[P][slot[row k + j]][row]) * svh_d[e]
+struct PostG {
+    const float* part; const int64_t* ids; const int* slot; const float* wts; const sycl::half* vec; float* out;
+    int U, M, k, R, P;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int w = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int nb = H / 128;
+        int row = w / nb, blk = w % nb;
+        if (row >= R) return;
+        int c0 = blk * 128 + lane * 8;
+        float acc[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+        for (int j = 0; j < k; ++j) {
+            int p = row * k + j;
+            long e = ids[p];
+            int u = slot[p];
+            float d[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) d[i] = 0.f;
+            for (int q = 0; q < P; ++q) {
+                const float* pd = part + (((long)q * U + u) * M + row) * H + c0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) d[i] += pd[i];
+            }
+            fwht(sg, d);
+            float ww = wts[p] * RS;
+            const sycl::half* sv = vec + e * VEC + OFF_SVH_D + c0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[i] += d[i] * (float)sv[i] * ww;
+        }
+        float* o = out + (long)row * H + c0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = acc[i];
+    }
+};
+
+template <typename Kn>
+static void run(sycl::queue& q, int units, Kn k) {
+    int per = 8;     // sub-groups per work-group
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>(((units + per - 1) / per) * per * 16), sycl::range<1>(per * 16)), k);
+}
+
+// vec: [E, VEC] fp16 (this layer), ptr: [E, 3] int64, Kt: [E, 3] int32, ids: [R, k] int64 (device)
+void moe_prep(at::Tensor y, at::Tensor ids, at::Tensor vec, at::Tensor ptr, at::Tensor Kt, at::Tensor xh, at::Tensor wp,
+              at::Tensor kk, at::Tensor wpd, at::Tensor kkd) {
+    int k = ids.size(1), n = ids.numel();
+    TORCH_CHECK(y.scalar_type() == at::kHalf && y.is_contiguous() && y.size(1) == H);
+    Prep p{reinterpret_cast<const sycl::half*>(y.data_ptr()), ids.data_ptr<int64_t>(),
+           reinterpret_cast<const sycl::half*>(vec.data_ptr()), ptr.data_ptr<int64_t>(), Kt.data_ptr<int>(),
+           reinterpret_cast<sycl::half*>(xh.data_ptr()), wp.data_ptr<int64_t>(), kk.data_ptr<int>(),
+           wpd.data_ptr<int64_t>(), kkd.data_ptr<int>(), k, n};
+    run(Q(y), 2 * n * (H / 128), p);
+}
+
+void moe_mid(at::Tensor part, at::Tensor ids, at::Tensor vec, at::Tensor xd, double L) {
+    int n = ids.numel(), P = part.size(0);
+    Mid m{part.data_ptr<float>(), ids.data_ptr<int64_t>(), reinterpret_cast<const sycl::half*>(vec.data_ptr()),
+          reinterpret_cast<sycl::half*>(xd.data_ptr()), n, P, (float)L};
+    run(Q(part), n * (I / 128), m);
+}
+
+void moe_post(at::Tensor part, at::Tensor ids, at::Tensor w, at::Tensor vec, at::Tensor out) {
+    int R = ids.size(0), k = ids.size(1), n = ids.numel(), P = part.size(0);
+    TORCH_CHECK(w.scalar_type() == at::kFloat && w.is_contiguous() && out.scalar_type() == at::kFloat);
+    Post p{part.data_ptr<float>(), ids.data_ptr<int64_t>(), w.data_ptr<float>(),
+           reinterpret_cast<const sycl::half*>(vec.data_ptr()), out.data_ptr<float>(), n, k, R, P};
+    run(Q(part), R * (H / 128), p);
+}
+
+void moe_route(at::Tensor logits, at::Tensor bias, c10::optional<at::Tensor> res, at::Tensor ids, at::Tensor w,
+               c10::optional<at::Tensor> want, double scaling) {
+    int R = logits.size(0), E = logits.size(1), k = ids.size(1);
+    TORCH_CHECK(logits.scalar_type() == at::kFloat && logits.is_contiguous() && E <= 1024);
+    int T = (E + 31) / 32 * 32;
+    const float* lp = logits.data_ptr<float>(); const float* bp = bias.data_ptr<float>();
+    const float* rp = res.has_value() ? res->data_ptr<float>() : nullptr;
+    int64_t* ip = ids.data_ptr<int64_t>(); float* wp = w.data_ptr<float>();
+    int64_t* wantp = want.has_value() ? want->data_ptr<int64_t>() : nullptr;
+    Q(logits).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sm(sycl::range<1>(64), h);
+        Route rt{lp, bp, rp, ip, wp, wantp, E, k, (float)scaling, E, nullptr, sm};
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(R * T), sycl::range<1>(T)), rt);
+    });
+}
+
+// fp16 GEMV for router logits: y[r, n] = sum_k x[r, k] * W(n)[k], W(n) = w0 row n (n < N0) or w1 row n - N0; one
+// sub-group per output row, x rows R <= 8.
+struct GemvH {
+    const sycl::half* x; const sycl::half* w0; const sycl::half* w1; float* y; int R, N0, N, K;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int n = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        if (n >= N) return;
+        const sycl::half* wr = n < N0 ? w0 + (long)n * K : w1 + (long)(n - N0) * K;
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int k0 = lane * 8; k0 < K; k0 += 128) {
+            sycl::vec<sycl::half, 8> wv = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(wr + k0);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                if (r >= R) break;
+                sycl::vec<sycl::half, 8> xv = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>(x + (long)r * K + k0);
+                float t = 0.f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) t += (float)wv[i] * (float)xv[i];
+                acc[r] += t;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (r >= R) break;
+            float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+            if (lane == 0) y[(long)r * N + n] = v;
+        }
+    }
+};
+
+// Router of this layer (+ optionally the next layer's router on the same input: the prefetch hint) in one call:
+// logits [R, E0 (+ E1)] fp32 scratch, then top-k per layer. ids0 / w0o / want0: this layer (want0 and res0: no-sync);
+// ids1 / w1o: the next layer's picks. mul0 / mul1: per-expert selection multipliers (the residency boost: cached experts
+// compete with s * (1 + boost) + bias; the weights stay the plain s); want0 then gets the unboosted top-k.
+void route_fused(at::Tensor x, at::Tensor w0, c10::optional<at::Tensor> w1, at::Tensor bias0,
+                 c10::optional<at::Tensor> bias1, c10::optional<at::Tensor> res0, at::Tensor ids0, at::Tensor w0o,
+                 c10::optional<at::Tensor> want0, c10::optional<at::Tensor> ids1, c10::optional<at::Tensor> w1o,
+                 at::Tensor logits, double scaling0, double scaling1, c10::optional<at::Tensor> mul0,
+                 c10::optional<at::Tensor> mul1, int64_t rows_per_block, double block_boost) {
+    int R = x.size(0), K = x.size(1), E0 = w0.size(0), k = ids0.size(1);
+    int E1 = w1.has_value() ? w1->size(0) : 0;
+    int N = E0 + E1;
+    TORCH_CHECK(x.scalar_type() == at::kHalf && x.is_contiguous() && R <= 8 && K % 128 == 0);
+    TORCH_CHECK(w0.is_contiguous() && w0.size(1) == K && logits.numel() >= (long)R * N && E0 <= 1024 && E1 <= 1024);
+    auto& q = Q(x);
+    GemvH g{reinterpret_cast<const sycl::half*>(x.data_ptr()), reinterpret_cast<const sycl::half*>(w0.data_ptr()),
+            E1 ? reinterpret_cast<const sycl::half*>(w1->data_ptr()) : nullptr, logits.data_ptr<float>(), R, E0, N, K};
+    run(q, N, g);
+    float* lp = logits.data_ptr<float>();
+    int S = (int)rows_per_block;
+    bool blk = S > 1 && block_boost > 0.0 && R % S == 0;
+    auto rt = [&](const float* l, int E, const at::Tensor& bias, const float* res, int64_t* ids, float* w,
+                  int64_t* want, double sc, const float* mul) {
+        int T = (E + 31) / 32 * 32;
+        const float* bp = bias.data_ptr<float>();
+        if (blk && !res) {
+            q.submit([&](sycl::handler& h) {
+                sycl::local_accessor<float, 1> sm(sycl::range<1>(64), h);
+                sycl::local_accessor<int, 1> ch(sycl::range<1>(T), h);
+                RouteBlock rb{l, N, bp, mul, ids, w, want, E, k, S, (float)sc, (float)block_boost, sm, ch};
+                h.parallel_for(sycl::nd_range<1>(sycl::range<1>((R / S) * T), sycl::range<1>(T)), rb);
+            });
+            return;
+        }
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> sm(sycl::range<1>(64), h);
+            Route r{l, bp, res, ids, w, want, E, k, (float)sc, N, mul, sm};
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(R * T), sycl::range<1>(T)), r);
+        });
+    };
+    rt(lp, E0, bias0, res0.has_value() ? res0->data_ptr<float>() : nullptr, ids0.data_ptr<int64_t>(),
+       w0o.data_ptr<float>(), want0.has_value() ? want0->data_ptr<int64_t>() : nullptr, scaling0,
+       mul0.has_value() ? mul0->data_ptr<float>() : nullptr);
+    if (E1)
+        rt(lp + E0, E1, *bias1, nullptr, ids1->data_ptr<int64_t>(), w1o->data_ptr<float>(), nullptr, scaling1,
+           mul1.has_value() ? mul1->data_ptr<float>() : nullptr);
+}
+
+// y [R, N] fp32 = x [R, K] fp16 @ w [N, K]^T fp16 (rows R <= 8)
+void gemv_h(at::Tensor x, at::Tensor w, at::Tensor y) {
+    int R = x.size(0), K = x.size(1), N = w.size(0);
+    TORCH_CHECK(x.scalar_type() == at::kHalf && x.is_contiguous() && w.is_contiguous() && w.size(1) == K && R <= 8);
+    TORCH_CHECK(y.scalar_type() == at::kFloat && y.is_contiguous() && y.numel() >= (long)R * N && K % 128 == 0);
+    GemvH g{reinterpret_cast<const sycl::half*>(x.data_ptr()), reinterpret_cast<const sycl::half*>(w.data_ptr()),
+            nullptr, y.data_ptr<float>(), R, N, N, K};
+    run(Q(x), N, g);
+}
+
+// Decode sync point between a layer's router and its expert kernels, without a host wait: copy the picks to pinned
+// host memory, publish ready = step, then spin (one work-item) until the host pager thread has made the picks
+// resident and published done >= step. A spin that exceeds max_it loads sets err = step and lets the stream go on
+// (the expert kernels skip null weight addresses; the host raises after the step). waits[0] = loads spent.
+struct SyncPoint {
+    const int64_t* src; int64_t* dst; int n; int64_t* ready; int64_t* done; int64_t* err; int64_t* waits;
+    const int64_t* step_p; int64_t max_it; int mode;     // step_p: device int64 (graph replays read the current step)     // mode 0: atomic-load spin, 1: atomic RMW spin, 2: no spin here
+    void operator()(sycl::nd_item<1> it) const {
+        int t = it.get_local_id(0), T = it.get_local_range(0);
+        for (int i = t; i < n; i += T) dst[i] = src[i];
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        sycl::group_barrier(it.get_group());
+        if (t != 0) return;
+        int64_t step = *step_p;
+        using A = sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                                   sycl::access::address_space::global_space>;
+        if (mode == 2) {
+            // plain store, no atomic: a GPU atomic on pinned host memory faulted ("not present", access type atomic)
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            *reinterpret_cast<volatile int64_t*>(ready) = step;
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            return;
+        }
+        A(*ready).store(step, sycl::memory_order::release);
+        A d(*done);
+        int64_t i = 0;
+        while ((mode == 1 ? d.fetch_add(0, sycl::memory_order::acq_rel) : d.load(sycl::memory_order::acquire)) < step) {
+            if (++i > max_it) { A(*err).store(step, sycl::memory_order::release); break; }
+        }
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        *waits = i;
+    }
+};
+
+// picks: device int64 (contiguous); host_picks: pinned int64 row (>= picks.numel()); flags: pinned int64; ready_i /
+// done_i / err_i: indices into flags; waits: pinned int64 slot.
+void sync_point(at::Tensor picks, at::Tensor host_picks, at::Tensor flags, int64_t ready_i, int64_t done_i,
+                int64_t err_i, at::Tensor waits, at::Tensor step, int64_t max_it, int64_t mode) {
+    int n = picks.numel();
+    TORCH_CHECK(picks.is_contiguous() && picks.scalar_type() == at::kLong && host_picks.numel() >= n);
+    TORCH_CHECK(flags.scalar_type() == at::kLong && host_picks.scalar_type() == at::kLong && waits.scalar_type() == at::kLong);
+    int64_t* f = flags.data_ptr<int64_t>();
+    SyncPoint k{picks.data_ptr<int64_t>(), host_picks.data_ptr<int64_t>(), n, f + ready_i, f + done_i, f + err_i,
+                waits.data_ptr<int64_t>(), step.data_ptr<int64_t>(), max_it, (int)mode};
+    Q(picks).parallel_for(sycl::nd_range<1>(sycl::range<1>(64), sycl::range<1>(64)), k);
+}
+
+// ---- grouped ops (ids [R, k] int64 device; y [R, H] fp16)
+void moe_group(at::Tensor ids, at::Tensor uniq, at::Tensor slot, at::Tensor nu) {
+    int n = ids.numel();
+    TORCH_CHECK(n <= 256 && ids.is_contiguous() && uniq.numel() >= n && slot.numel() >= n);
+    Group g{ids.data_ptr<int64_t>(), uniq.data_ptr<int64_t>(), slot.data_ptr<int>(), nu.data_ptr<int>(), n};
+    int T = (n + 15) / 16 * 16;
+    Q(ids).parallel_for(sycl::nd_range<1>(sycl::range<1>(T), sycl::range<1>(T)), g);
+}
+
+void moe_prep_g(at::Tensor y, at::Tensor uniq, at::Tensor vec, at::Tensor ptr, at::Tensor Kt, at::Tensor xh,
+                at::Tensor wp, at::Tensor kk, at::Tensor wpd, at::Tensor kkd) {
+    int M = y.size(0), U = uniq.numel();
+    TORCH_CHECK(y.scalar_type() == at::kHalf && y.is_contiguous() && y.size(1) == H && xh.numel() >= (long)2 * U * M * H);
+    PrepG p{reinterpret_cast<const sycl::half*>(y.data_ptr()), uniq.data_ptr<int64_t>(),
+            reinterpret_cast<const sycl::half*>(vec.data_ptr()), ptr.data_ptr<int64_t>(), Kt.data_ptr<int>(),
+            reinterpret_cast<sycl::half*>(xh.data_ptr()), wp.data_ptr<int64_t>(), kk.data_ptr<int>(),
+            wpd.data_ptr<int64_t>(), kkd.data_ptr<int>(), U, M};
+    run(Q(y), 2 * U * M * (H / 128), p);
+}
+
+void moe_mid_g(at::Tensor part, at::Tensor uniq, at::Tensor vec, at::Tensor xd, int64_t M, double L) {
+    int U = uniq.numel(), P = part.size(0);
+    MidG m{part.data_ptr<float>(), uniq.data_ptr<int64_t>(), reinterpret_cast<const sycl::half*>(vec.data_ptr()),
+           reinterpret_cast<sycl::half*>(xd.data_ptr()), U, (int)M, P, (float)L};
+    run(Q(part), U * (int)M * (I / 128), m);
+}
+
+void moe_post_g(at::Tensor part, at::Tensor ids, at::Tensor slot, at::Tensor w, at::Tensor vec, at::Tensor out) {
+    int R = ids.size(0), k = ids.size(1), P = part.size(0), U = part.size(1), M = part.size(2);
+    TORCH_CHECK(w.scalar_type() == at::kFloat && w.is_contiguous() && out.scalar_type() == at::kFloat && M == R);
+    PostG p{part.data_ptr<float>(), ids.data_ptr<int64_t>(), slot.data_ptr<int>(), w.data_ptr<float>(),
+            reinterpret_cast<const sycl::half*>(vec.data_ptr()), out.data_ptr<float>(), U, M, k, R, P};
+    run(Q(part), R * (H / 128), p);
+}
+
+}  // namespace dsvglue
+
+TORCH_LIBRARY(dsv_glue, m) {
+    m.def("moe_prep(Tensor y, Tensor ids, Tensor vec, Tensor ptr, Tensor Kt, Tensor(a!) xh, Tensor(b!) wp, Tensor(c!) kk, "
+          "Tensor(d!) wpd, Tensor(e!) kkd) -> ()");
+    m.def("moe_mid(Tensor part, Tensor ids, Tensor vec, Tensor(a!) xd, float L) -> ()");
+    m.def("moe_post(Tensor part, Tensor ids, Tensor w, Tensor vec, Tensor(a!) out) -> ()");
+    m.def("moe_route(Tensor logits, Tensor bias, Tensor? res, Tensor(a!) ids, Tensor(b!) w, Tensor(c!)? want, "
+          "float scaling) -> ()");
+    m.def("route_fused(Tensor x, Tensor w0, Tensor? w1, Tensor bias0, Tensor? bias1, Tensor? res0, Tensor(a!) ids0, "
+          "Tensor(b!) w0o, Tensor(c!)? want0, Tensor(d!)? ids1, Tensor(e!)? w1o, Tensor(f!) logits, float scaling0, "
+          "float scaling1, Tensor? mul0=None, Tensor? mul1=None, int rows_per_block=1, float block_boost=0.0) -> ()");
+    m.def("sync_point(Tensor picks, Tensor(a!) host_picks, Tensor(b!) flags, int ready_i, int done_i, int err_i, "
+          "Tensor(c!) waits, Tensor step, int max_it, int mode=0) -> ()");
+    m.def("gemv_h(Tensor x, Tensor w, Tensor(a!) y) -> ()");
+    m.def("moe_group(Tensor ids, Tensor(a!) uniq, Tensor(b!) slot, Tensor(c!) nu) -> ()");
+    m.def("moe_prep_g(Tensor y, Tensor uniq, Tensor vec, Tensor ptr, Tensor Kt, Tensor(a!) xh, Tensor(b!) wp, "
+          "Tensor(c!) kk, Tensor(d!) wpd, Tensor(e!) kkd) -> ()");
+    m.def("moe_mid_g(Tensor part, Tensor uniq, Tensor vec, Tensor(a!) xd, int M, float L) -> ()");
+    m.def("moe_post_g(Tensor part, Tensor ids, Tensor slot, Tensor w, Tensor vec, Tensor(a!) out) -> ()");
+}
+TORCH_LIBRARY_IMPL(dsv_glue, XPU, m) {
+    m.impl("moe_prep", &dsvglue::moe_prep);
+    m.impl("moe_mid", &dsvglue::moe_mid);
+    m.impl("moe_post", &dsvglue::moe_post);
+    m.impl("moe_route", &dsvglue::moe_route);
+    m.impl("route_fused", &dsvglue::route_fused);
+    m.impl("sync_point", &dsvglue::sync_point);
+    m.impl("gemv_h", &dsvglue::gemv_h);
+    m.impl("moe_group", &dsvglue::moe_group);
+    m.impl("moe_prep_g", &dsvglue::moe_prep_g);
+    m.impl("moe_mid_g", &dsvglue::moe_mid_g);
+    m.impl("moe_post_g", &dsvglue::moe_post_g);
+}

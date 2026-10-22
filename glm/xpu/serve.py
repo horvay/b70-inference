@@ -168,12 +168,13 @@ def partial_suffix(text, marker):
 
 class Splitter:
     """Splits streamed model text into reasoning (until </think>), visible content, and a held tool-call tail."""
+    TOOL_OPEN = "<tool_call>"     # where the held tool-call tail starts (another model's server sets its own)
 
     def __init__(self, thinking, tools):
         self.in_think = thinking
         self.tools = bool(tools)
         self.buf = ""            # text not yet classified (a possible partial marker)
-        self.held = ""           # from the first <tool_call> on
+        self.held = ""           # from the first TOOL_OPEN on
         self.started = False     # leading whitespace of the content is dropped
         self.lead = not thinking  # thinking off: a reply that still opens with <think> is reasoning, not story
 
@@ -208,12 +209,12 @@ class Splitter:
                 self.buf = ""
                 break
             if self.tools:
-                c, sep, rest = self.buf.partition("<tool_call>")
+                c, sep, rest = self.buf.partition(self.TOOL_OPEN)
                 if sep:
                     self._content(c, out)
                     self.held, self.buf = sep + rest, ""
                     break
-                hold = 0 if final else partial_suffix(c, "<tool_call>")
+                hold = 0 if final else partial_suffix(c, self.TOOL_OPEN)
                 self._content(c[:len(c) - hold], out)
                 self.buf = c[len(c) - hold:]
                 break
@@ -387,6 +388,9 @@ def sse(obj):
 
 
 def make_handler(engine, a):
+    # an engine for another model may bring its own tool-call format (dsv41/xpu/serve.py)
+    split = getattr(engine, "Splitter", Splitter)
+    parse_calls = getattr(engine, "parse_tool_calls", parse_tool_calls)
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"     # responses end when the connection closes (streams have no length)
@@ -513,7 +517,7 @@ def make_handler(engine, a):
             base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": a.served_name}
             # the reply starts inside a thought when the prompt leaves one open (thinking on, or a client prefill
             # that continues a thought); a prefill that closes it makes the reply plain content
-            sp = Splitter(thinking and prompt.rfind("<think>") > prompt.rfind("</think>"), tools)
+            sp = split(thinking and prompt.rfind("<think>") > prompt.rfind("</think>"), tools)
             if body.get("stream"):
                 def chunk(delta, fin=None, **extra):
                     return sse(dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": fin}], **extra))
@@ -536,7 +540,7 @@ def make_handler(engine, a):
                         raise
                 reason = info["finish_reason"]
                 if sp.held:
-                    content, calls = parse_tool_calls(sp.held, tools)
+                    content, calls = parse_calls(sp.held, tools)
                     if content:
                         self.wfile.write(chunk({"content": content}))
                     if calls:
@@ -557,7 +561,7 @@ def make_handler(engine, a):
                     (reasoning if kind == "reasoning" else content).append(t)
             text, calls = "".join(content), []
             if sp.held:
-                rest, calls = parse_tool_calls(sp.held, tools)
+                rest, calls = parse_calls(sp.held, tools)
                 text = text.strip() + ("\n" + rest if rest else "")
             msg = {"role": "assistant", "content": text.strip()}
             if thinking:

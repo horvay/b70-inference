@@ -1,0 +1,246 @@
+// DeepSeek-V4.1 hyper-connection site (DSV41HyperConnection.mix_full + collapse + the block's RMSNorm) for decode rows.
+//   mix = (flat(x) @ fn^T) * rsqrt(mean(flat(x)^2) + rms_eps), x [R, 4, D] fp32, fn [24, 4D] fp32
+//   pre = sigmoid(mix[0:4] * s0 + b[0:4]) + hc_eps; post = 2 sigmoid(mix[4:8] * s1 + b[4:8])
+//   comb = sinkhorn(softmax(mix[8:24] * s2 + b[8:24] as 4x4, -1) + hc_eps)
+//   y = rms_norm(half(sum_h pre_in[h] * x[h]), w)  (fp16 out; pre_in = the previous site's pre)
+// Two launches: partial dot products over column chunks, then one work-group per row finishes everything.
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+namespace dsvhc {
+
+constexpr int NM = 24, NP = 25, CH = 512;
+
+struct Partial {
+    const float* x; const float* fn; float* part; int R, W, nch;     // W = 4D
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int w = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int r = w / nch, c = w % nch;
+        if (r >= R) return;
+        const float* xr = x + (long)r * W + c * CH;
+        float xv[CH / 16];
+        float ss = 0.f;
+#pragma unroll
+        for (int i = 0; i < CH / 16; ++i) { xv[i] = xr[i * 16 + lane]; ss += xv[i] * xv[i]; }
+        float* pr = part + ((long)r * nch + c) * NP;
+        for (int m = 0; m < NM; ++m) {
+            const float* fr = fn + (long)m * W + c * CH;
+            float t = 0.f;
+#pragma unroll
+            for (int i = 0; i < CH / 16; ++i) t += xv[i] * fr[i * 16 + lane];
+            t = sycl::reduce_over_group(sg, t, sycl::plus<float>());
+            if (lane == 0) pr[m] = t;
+        }
+        ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+        if (lane == 0) pr[NM] = ss;
+    }
+};
+
+// Residual update of the previous site fused with this site's partials: each sub-group takes 128 columns d of all
+// 4 streams (512 values; lane: 8 consecutive d), x[h, d] <- post[h] y[d] + sum_g comb[g, h] x[g, d] (written back),
+// then the partial dot products of the updated values with fn. Partials per (row, 128-column chunk).
+struct PartialApply {
+    float* x; const void* y; int y_half; const float* post; const float* comb; const float* fn; float* part;
+    int R, D, nch;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int w = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int r = w / nch, c = w % nch;
+        if (r >= R) return;
+        int d0 = c * 128 + lane * 8;
+        float* xr = x + (long)r * 4 * D;
+        float yv[8];
+        if (y_half) {
+            sycl::vec<sycl::half, 8> a = *reinterpret_cast<const sycl::vec<sycl::half, 8>*>((const sycl::half*)y + (long)r * D + d0);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) yv[i] = (float)a[i];
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) yv[i] = ((const float*)y)[(long)r * D + d0 + i];
+        }
+        float xo[4][8], xn[4][8];
+#pragma unroll
+        for (int g = 0; g < 4; ++g)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) xo[g][i] = xr[g * D + d0 + i];
+        const float* cm = comb + r * 16;
+        const float* pp = post + r * 4;
+        float ss = 0.f;
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+            float ph = pp[h], c0 = cm[h], c1 = cm[4 + h], c2 = cm[8 + h], c3 = cm[12 + h];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float v = ph * yv[i] + c0 * xo[0][i] + c1 * xo[1][i] + c2 * xo[2][i] + c3 * xo[3][i];
+                xn[h][i] = v;
+                ss += v * v;
+            }
+        }
+        sycl::group_barrier(sg);          // every lane has read its x before anyone writes (same lane, but keep order)
+#pragma unroll
+        for (int h = 0; h < 4; ++h)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) xr[h * D + d0 + i] = xn[h][i];
+        float* pr = part + ((long)r * nch + c) * NP;
+        int W = 4 * D;
+        for (int m = 0; m < NM; ++m) {
+            const float* fr = fn + (long)m * W;
+            float t = 0.f;
+#pragma unroll
+            for (int h = 0; h < 4; ++h)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) t += xn[h][i] * fr[h * D + d0 + i];
+            t = sycl::reduce_over_group(sg, t, sycl::plus<float>());
+            if (lane == 0) pr[m] = t;
+        }
+        ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+        if (lane == 0) pr[NM] = ss;
+    }
+};
+
+struct Final {
+    const float* x; const float* part; const float* base; const float* scale; const float* pre_in;
+    const void* w; int w_bf16; float* pre; float* post; float* comb; sycl::half* y;
+    int R, D, nch, iters; float rms_eps, hc_eps, norm_eps;
+    sycl::local_accessor<float, 1> sm;
+    void operator()(sycl::nd_item<1> it) const {
+        int r = it.get_group(0);
+        int t = it.get_local_id(0), T = it.get_local_range(0);
+        float* s = &sm[0];                // [0, 25) sums, [32, 56) mix outputs, [64, 68) pre_in, [72] norm
+        if (t < NP) {
+            float a = 0.f;
+            for (int c = 0; c < nch; ++c) a += part[((long)r * nch + c) * NP + t];
+            s[t] = a;
+        }
+        if (t < 4) s[64 + t] = pre_in ? pre_in[r * 4 + t] : (t == 0 ? 1.f : 0.f);
+        sycl::group_barrier(it.get_group());
+        if (t == 0) {
+            float rm = sycl::rsqrt(s[NM] / (4.f * D) + rms_eps);
+            float m[NM];
+            for (int i = 0; i < NM; ++i) m[i] = s[i] * rm;
+            for (int h = 0; h < 4; ++h) {
+                pre[r * 4 + h] = 1.f / (1.f + sycl::exp(-(m[h] * scale[0] + base[h]))) + hc_eps;
+                post[r * 4 + h] = 2.f / (1.f + sycl::exp(-(m[4 + h] * scale[1] + base[4 + h])));
+            }
+            float c[16];
+            for (int i = 0; i < 4; ++i) {
+                float mx = -1e30f;
+                for (int j = 0; j < 4; ++j) { c[i * 4 + j] = m[8 + i * 4 + j] * scale[2] + base[8 + i * 4 + j]; mx = sycl::fmax(mx, c[i * 4 + j]); }
+                float su = 0.f;
+                for (int j = 0; j < 4; ++j) { c[i * 4 + j] = sycl::exp(c[i * 4 + j] - mx); su += c[i * 4 + j]; }
+                for (int j = 0; j < 4; ++j) c[i * 4 + j] = c[i * 4 + j] / su + hc_eps;
+            }
+            for (int j = 0; j < 4; ++j) {        // column normalize
+                float su = 0.f;
+                for (int i = 0; i < 4; ++i) su += c[i * 4 + j];
+                for (int i = 0; i < 4; ++i) c[i * 4 + j] /= (su + hc_eps);
+            }
+            for (int k = 0; k < iters - 1; ++k) {
+                for (int i = 0; i < 4; ++i) {
+                    float su = 0.f;
+                    for (int j = 0; j < 4; ++j) su += c[i * 4 + j];
+                    for (int j = 0; j < 4; ++j) c[i * 4 + j] /= (su + hc_eps);
+                }
+                for (int j = 0; j < 4; ++j) {
+                    float su = 0.f;
+                    for (int i = 0; i < 4; ++i) su += c[i * 4 + j];
+                    for (int i = 0; i < 4; ++i) c[i * 4 + j] /= (su + hc_eps);
+                }
+            }
+            for (int i = 0; i < 16; ++i) comb[r * 16 + i] = c[i];
+        }
+        // collapse with pre_in, round to half, RMS norm
+        const float* xr = x + (long)r * 4 * D;
+        float p0 = s[64], p1 = s[65], p2 = s[66], p3 = s[67];
+        float ss = 0.f;
+        for (int d = t; d < D; d += T) {
+            float v = (float)(sycl::half)(p0 * xr[d] + p1 * xr[D + d] + p2 * xr[2 * D + d] + p3 * xr[3 * D + d]);
+            ss += v * v;
+        }
+        ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+        float rn = sycl::rsqrt(ss / D + norm_eps);
+        for (int d = t; d < D; d += T) {
+            float v = (float)(sycl::half)(p0 * xr[d] + p1 * xr[D + d] + p2 * xr[2 * D + d] + p3 * xr[3 * D + d]);
+            float wv = w ? (w_bf16 ? (float)sycl::bit_cast<sycl::ext::oneapi::bfloat16>(((const uint16_t*)w)[d])
+                                   : (float)((const sycl::half*)w)[d]) : 1.f;
+            y[(long)r * D + d] = (sycl::half)(v * rn * wv);
+        }
+    }
+};
+
+static void site_impl(at::Tensor x, at::Tensor fn, at::Tensor base, at::Tensor scale, c10::optional<at::Tensor> pre_in,
+               c10::optional<at::Tensor> w, at::Tensor pre, at::Tensor post, at::Tensor comb, at::Tensor y,
+               at::Tensor part, int64_t iters, double rms_eps, double hc_eps, double norm_eps,
+               const at::Tensor* ay, const at::Tensor* apost, const at::Tensor* acomb) {
+    TORCH_CHECK(x.scalar_type() == at::kFloat && x.is_contiguous() && x.size(-2) == 4);
+    int D = x.size(-1);
+    int R = x.numel() / (4 * D);
+    int W = 4 * D;
+    TORCH_CHECK(W % CH == 0 && fn.is_contiguous() && fn.size(0) == NM && fn.size(1) == W);
+    int nch = W / CH;
+    TORCH_CHECK(part.numel() >= (long)R * nch * NP);
+    auto& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+    int per = 8;
+    if (ay) {
+        TORCH_CHECK(D % 128 == 0 && ay->is_contiguous() && apost->is_contiguous() && acomb->is_contiguous());
+        nch = D / 128;
+        TORCH_CHECK(part.numel() >= (long)R * nch * NP);
+        PartialApply pa{x.data_ptr<float>(), ay->data_ptr(), ay->scalar_type() == at::kHalf, apost->data_ptr<float>(),
+                        acomb->data_ptr<float>(), fn.data_ptr<float>(), part.data_ptr<float>(), R, D, nch};
+        int units = R * nch;
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>(((units + per - 1) / per) * per * 16), sycl::range<1>(per * 16)), pa);
+    } else {
+        Partial p{x.data_ptr<float>(), fn.data_ptr<float>(), part.data_ptr<float>(), R, W, nch};
+        int units = R * nch;
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>(((units + per - 1) / per) * per * 16), sycl::range<1>(per * 16)), p);
+    }
+    const void* wp = w.has_value() ? w->data_ptr() : nullptr;
+    int wb = w.has_value() && w->scalar_type() == at::kBFloat16;
+    const float* pin = pre_in.has_value() ? pre_in->data_ptr<float>() : nullptr;
+    float* prep = pre.data_ptr<float>(); float* postp = post.data_ptr<float>(); float* combp = comb.data_ptr<float>();
+    sycl::half* yp = reinterpret_cast<sycl::half*>(y.data_ptr());
+    const float* xp = x.data_ptr<float>(); const float* pp = part.data_ptr<float>();
+    const float* bp = base.data_ptr<float>(); const float* sp = scale.data_ptr<float>();
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sm(sycl::range<1>(80), h);
+        Final f{xp, pp, bp, sp, pin, wp, wb, prep, postp, combp, yp, R, D, nch, (int)iters, (float)rms_eps,
+                (float)hc_eps, (float)norm_eps, sm};
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(R * 256), sycl::range<1>(256)), f);
+    });
+}
+
+void hc41_site(at::Tensor x, at::Tensor fn, at::Tensor base, at::Tensor scale, c10::optional<at::Tensor> pre_in,
+               c10::optional<at::Tensor> w, at::Tensor pre, at::Tensor post, at::Tensor comb, at::Tensor y,
+               at::Tensor part, int64_t iters, double rms_eps, double hc_eps, double norm_eps) {
+    site_impl(x, fn, base, scale, pre_in, w, pre, post, comb, y, part, iters, rms_eps, hc_eps, norm_eps, nullptr,
+              nullptr, nullptr);
+}
+
+// x <- apost (x) ay + acomb^T x (the previous site's residual update), then the site on the updated x
+void hc41_apply_site(at::Tensor x, at::Tensor ay, at::Tensor apost, at::Tensor acomb, at::Tensor fn, at::Tensor base,
+                     at::Tensor scale, c10::optional<at::Tensor> pre_in, c10::optional<at::Tensor> w, at::Tensor pre,
+                     at::Tensor post, at::Tensor comb, at::Tensor y, at::Tensor part, int64_t iters, double rms_eps,
+                     double hc_eps, double norm_eps) {
+    site_impl(x, fn, base, scale, pre_in, w, pre, post, comb, y, part, iters, rms_eps, hc_eps, norm_eps, &ay, &apost,
+              &acomb);
+}
+
+}  // namespace dsvhc
+
+TORCH_LIBRARY(dsv_hc, m) {
+    m.def("hc41_site(Tensor x, Tensor fn, Tensor base, Tensor scale, Tensor? pre_in, Tensor? w, Tensor(a!) pre, "
+          "Tensor(b!) post, Tensor(c!) comb, Tensor(d!) y, Tensor(e!) part, int iters, float rms_eps, float hc_eps, "
+          "float norm_eps) -> ()");
+    m.def("hc41_apply_site(Tensor(z!) x, Tensor ay, Tensor apost, Tensor acomb, Tensor fn, Tensor base, Tensor scale, "
+          "Tensor? pre_in, Tensor? w, Tensor(a!) pre, Tensor(b!) post, Tensor(c!) comb, Tensor(d!) y, Tensor(e!) part, "
+          "int iters, float rms_eps, float hc_eps, float norm_eps) -> ()");
+}
+TORCH_LIBRARY_IMPL(dsv_hc, XPU, m) {
+    m.impl("hc41_site", &dsvhc::hc41_site);
+    m.impl("hc41_apply_site", &dsvhc::hc41_apply_site);
+}

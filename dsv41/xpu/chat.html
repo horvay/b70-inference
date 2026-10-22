@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek-V4.1-Flash on the B70</title>
+<style>
+  :root { --bg: #15171c; --panel: #1d2027; --line: #2c313b; --text: #e3e6ec; --dim: #8b93a3; --accent: #6ea8ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, sans-serif;
+         display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; gap: 16px; align-items: center; padding: 10px 18px; border-bottom: 1px solid var(--line);
+           background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header label { color: var(--dim); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  header input[type=number] { width: 60px; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+                              border-radius: 4px; padding: 2px 4px; }
+  header button { margin-left: auto; }
+  #log { flex: 1; overflow-y: auto; padding: 18px; }
+  .msg { max-width: 860px; margin: 0 auto 16px; }
+  .who { font-size: 12px; color: var(--dim); margin-bottom: 3px; }
+  .body { white-space: pre-wrap; word-wrap: break-word; padding: 10px 14px; border-radius: 8px; background: var(--panel); }
+  .user .body { background: #23324d; }
+  details { margin-bottom: 6px; color: var(--dim); font-size: 13px; }
+  details .think { white-space: pre-wrap; padding: 6px 10px; border-left: 2px solid var(--line); }
+  .stats { font-size: 12px; color: var(--dim); margin-top: 4px; }
+  .err { color: #ff8a8a; }
+  form { display: flex; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); background: var(--panel); }
+  textarea { flex: 1; resize: none; height: 64px; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+             border-radius: 6px; padding: 8px; font: inherit; }
+  button { background: var(--accent); color: #0d1320; border: 0; border-radius: 6px; padding: 8px 16px; font-weight: 600;
+           cursor: pointer; }
+  button.secondary { background: var(--line); color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1>DeepSeek-V4.1-Flash · Arc Pro B70</h1>
+  <label><input type="checkbox" id="think"> Thinking</label>
+  <label>Temperature <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
+  <label>Max tokens <input type="number" id="maxtok" value="1024" step="64" min="16"></label>
+  <label>System <input type="text" id="sys" placeholder="optional system prompt"
+         style="width: 220px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px;"></label>
+  <button class="secondary" id="clear" type="button">New chat</button>
+</header>
+<div id="log"></div>
+<form id="f">
+  <textarea id="in" placeholder="Message (Enter sends, Shift+Enter for a new line)" autofocus></textarea>
+  <button id="send">Send</button>
+</form>
+<script>
+const log = document.getElementById("log"), input = document.getElementById("in"), send = document.getElementById("send");
+let history = [], busy = null;
+
+function add(role) {
+  const m = document.createElement("div");
+  m.className = "msg " + role;
+  m.innerHTML = `<div class="who">${role === "user" ? "You" : "DeepSeek"}</div>`;
+  const body = document.createElement("div");
+  body.className = "body";
+  m.appendChild(body);
+  log.appendChild(m);
+  return { m, body };
+}
+const scroll = () => { log.scrollTop = log.scrollHeight; };
+
+document.getElementById("clear").onclick = () => { if (busy) busy.abort(); history = []; log.innerHTML = ""; };
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); document.getElementById("f").requestSubmit(); }
+});
+
+document.getElementById("f").onsubmit = async e => {
+  e.preventDefault();
+  if (busy) { busy.abort(); return; }
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  add("user").body.textContent = text;
+  history.push({ role: "user", content: text });
+  const out = add("assistant");
+  out.body.textContent = "…";
+  let thinkBox = null, content = "", reasoning = "";
+  const sys = document.getElementById("sys").value.trim();
+  const messages = (sys ? [{ role: "system", content: sys }] : []).concat(history);
+  busy = new AbortController();
+  send.textContent = "Stop";
+  try {
+    const r = await fetch("/v1/chat/completions", {
+      method: "POST", signal: busy.signal, headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages, stream: true,
+        temperature: parseFloat(document.getElementById("temp").value),
+        max_tokens: parseInt(document.getElementById("maxtok").value),
+        chat_template_kwargs: { enable_thinking: document.getElementById("think").checked },
+      }),
+    });
+    if (!r.ok) throw new Error((await r.json()).error?.message || r.statusText);
+    const rd = r.body.getReader(), dec = new TextDecoder();
+    let buf = "", final = null;
+    while (true) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 2);
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        const ev = JSON.parse(data), d = ev.choices?.[0]?.delta || {};
+        if (ev.timings) final = ev;
+        if (d.reasoning_content) {
+          if (!thinkBox) {
+            const det = document.createElement("details");
+            det.open = true;
+            det.innerHTML = "<summary>Thinking</summary>";
+            thinkBox = document.createElement("div");
+            thinkBox.className = "think";
+            det.appendChild(thinkBox);
+            out.m.insertBefore(det, out.body);
+          }
+          reasoning += d.reasoning_content;
+          thinkBox.textContent = reasoning;
+        }
+        if (d.content) content += d.content;
+        out.body.textContent = content || (reasoning ? "" : "…");
+        scroll();
+      }
+    }
+    if (thinkBox) thinkBox.parentElement.open = false;
+    history.push({ role: "assistant", content });
+    if (final) {
+      const t = final.timings, u = final.usage;
+      const s = document.createElement("div");
+      s.className = "stats";
+      s.textContent = `${u.completion_tokens} tokens at ${t.decode_tok_s ?? "?"} tok/s · first token after ${t.prompt_s} s` +
+        ` · prompt ${u.prompt_tokens} tokens (${t.cached_tokens} cached)`;
+      out.m.appendChild(s);
+    }
+  } catch (err) {
+    if (err.name === "AbortError") {
+      if (content) history.push({ role: "assistant", content });
+      const s = document.createElement("div");
+      s.className = "stats";
+      s.textContent = "stopped";
+      out.m.appendChild(s);
+    } else {
+      out.body.innerHTML = `<span class="err">${String(err.message || err)}</span>`;
+      history.pop();
+    }
+  } finally {
+    busy = null;
+    send.textContent = "Send";
+    scroll();
+  }
+};
+</script>
+</body>
+</html>

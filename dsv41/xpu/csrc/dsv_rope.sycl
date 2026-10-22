@@ -1,0 +1,121 @@
+// exllamav3 ext.rope on XPU: per (token, head) row: optional RMS norm with a weight (fp16 or bf16; a head group without
+// a weight is left unnormalized), then rotation of rd = 2 * len(inv_freq) dims at rotate_offset, GPT-J (interleaved
+// pairs) or NeoX (halves). In place or out of place over strided fp16 views ([bsz, seq, heads, D] with any
+// token / head stride, unit dim stride): DeepSeek-V4 rotates trailing-slice views of wider heads.
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+namespace dsvrope {
+
+struct Part {
+    const sycl::half* in; sycl::half* out; long ts_in, hs_in, ts_out, hs_out; int heads; const void* w; int w_bf16;
+};
+
+struct Rope {
+    Part a, b;                  // q, k (b.heads may be 0)
+    const float* inv_freq; int rd, D, rot_off, seq, mode, pos0;
+    const int* positions; const int* position_ids; float eps, cbias, attn;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int r = it.get_group(0) * (it.get_local_range(0) / 16) + sg.get_group_linear_id();
+        int H = a.heads + b.heads;
+        int tok = r / H, h = r % H;
+        if (tok >= seq * nb) return;
+        const Part& P = h < a.heads ? a : b;
+        int hh = h < a.heads ? h : h - a.heads;
+        int bi = tok / seq, t = tok % seq;
+        int pos = positions ? positions[bi] + t : (position_ids ? position_ids[tok] : pos0 + t);
+        const sycl::half* xi = P.in + tok * P.ts_in + hh * P.hs_in;
+        sycl::half* xo = P.out + tok * P.ts_out + hh * P.hs_out;
+        // rows are at most 512 wide: 16 lanes x 32 values
+        float v[32];
+        int n = D / 16;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) v[i] = i < n ? (float)xi[i * 16 + lane] : 0.f;
+        if (P.w) {
+            float ss = 0.f;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) ss += v[i] * v[i];
+            ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+            float rm = sycl::rsqrt(ss / D + eps);
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                if (i < n) {
+                    int c = i * 16 + lane;
+                    float w = P.w_bf16 ? (float)sycl::bit_cast<sycl::ext::oneapi::bfloat16>(((const uint16_t*)P.w)[c])
+                                       : (float)((const sycl::half*)P.w)[c];
+                    v[i] = (float)(sycl::half)(v[i] * rm) * (w + cbias);
+                }
+            }
+        }
+        // GPT-J rotation in registers: column c = i * 16 + lane pairs with c ^ 1 (lane ^ 1, same i)
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            if (i >= n) break;
+            int c = i * 16 + lane;
+            float other = sycl::permute_group_by_xor(sg, v[i], 1);
+            if (c >= rot_off && c < rot_off + rd) {
+                int p = (c - rot_off) >> 1;
+                float ang = (float)pos * inv_freq[p];
+                float sn = sycl::sin(ang) * attn, cs = sycl::cos(ang) * attn;
+                v[i] = (c & 1) == 0 ? v[i] * cs - other * sn : v[i] * cs + other * sn;
+            }
+            xo[c] = (sycl::half)v[i];
+        }
+    }
+    int nb;
+};
+
+static Part part(const at::Tensor& x, const at::Tensor& o, const c10::optional<at::Tensor>& w) {
+    TORCH_CHECK(x.dim() == 4 && x.stride(3) == 1 && o.stride(3) == 1 && x.scalar_type() == at::kHalf);
+    TORCH_CHECK(x.stride(0) == x.size(1) * x.stride(1) || x.size(0) == 1, "rope: batch must be dense over seq");
+    TORCH_CHECK(o.stride(0) == o.size(1) * o.stride(1) || o.size(0) == 1, "rope: batch must be dense over seq");
+    Part p{reinterpret_cast<const sycl::half*>(x.data_ptr()), reinterpret_cast<sycl::half*>(o.data_ptr()),
+           x.stride(1), x.stride(2), o.stride(1), o.stride(2), (int)x.size(2), nullptr, 0};
+    if (w.has_value()) {
+        p.w = w->data_ptr();
+        p.w_bf16 = w->scalar_type() == at::kBFloat16;
+    }
+    return p;
+}
+
+void rope(at::Tensor q, at::Tensor out_q, c10::optional<at::Tensor> k, c10::optional<at::Tensor> out_k,
+          at::Tensor inv_freq, int64_t position, c10::optional<at::Tensor> positions,
+          c10::optional<at::Tensor> position_ids, int64_t mode, double attn_factor, c10::optional<at::Tensor> q_norm,
+          c10::optional<at::Tensor> k_norm, double eps, double cbias, int64_t rotate_offset) {
+    TORCH_CHECK(inv_freq.scalar_type() == at::kFloat && inv_freq.is_contiguous());
+    TORCH_CHECK(mode == 1 && rotate_offset % 2 == 0, "rope: GPT-J only");
+    int D = q.size(3);
+    TORCH_CHECK(D % 16 == 0 && D <= 512);
+    Rope r{};
+    r.a = part(q, out_q, q_norm);
+    r.b = Part{};
+    if (k.has_value() && k->defined()) {
+        TORCH_CHECK(k->size(3) == D);
+        r.b = part(*k, *out_k, k_norm);
+    }
+    r.inv_freq = inv_freq.data_ptr<float>();
+    r.rd = inv_freq.size(-1) * 2; r.D = D; r.rot_off = rotate_offset; r.seq = q.size(1); r.mode = mode;
+    r.pos0 = position; r.eps = eps; r.cbias = cbias; r.attn = attn_factor; r.nb = q.size(0);
+    r.positions = positions.has_value() ? positions->data_ptr<int>() : nullptr;
+    r.position_ids = position_ids.has_value() ? position_ids->data_ptr<int>() : nullptr;
+    int rows = q.size(0) * q.size(1) * (r.a.heads + r.b.heads);
+    if (rows == 0) return;
+    auto& qq = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    int per = 8;
+    qq.parallel_for(sycl::nd_range<1>(sycl::range<1>(((rows + per - 1) / per) * per * 16), sycl::range<1>(per * 16)), r);
+}
+
+}  // namespace dsvrope
+
+TORCH_LIBRARY(dsv_rope, m) {
+    m.def("rope(Tensor q, Tensor(a!) out_q, Tensor? k, Tensor(b!)? out_k, Tensor inv_freq, int position, Tensor? positions, "
+          "Tensor? position_ids, int mode, float attn_factor, Tensor? q_norm, Tensor? k_norm, float eps, float cbias, "
+          "int rotate_offset) -> ()");
+}
+TORCH_LIBRARY_IMPL(dsv_rope, XPU, m) {
+    m.impl("rope", &dsvrope::rope);
+}

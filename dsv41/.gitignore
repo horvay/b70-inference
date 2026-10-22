@@ -1,0 +1,8 @@
+# local state, logs, caches (run/ also holds the experiment queue scripts and their logs)
+run/
+cache/
+notes/
+__pycache__/
+*.pyc
+# built kernels (xpu/build.sh)
+*.so

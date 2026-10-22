@@ -1,0 +1,227 @@
+diff --git i/exllamav3/ext.py w/exllamav3/ext.py
+index 4f1be751..a90a5c76 100644
+--- i/exllamav3/ext.py
++++ w/exllamav3/ext.py
+@@ -27,7 +27,10 @@ def is_precompiled_extension_available():
+         for suffix in importlib.machinery.EXTENSION_SUFFIXES
+     )
+ 
+-if is_precompiled_extension_available():
++if os.environ.get("EXL3_XPU") == "1":
++    # Intel XPU port: a Python shim (b70-inference dsv41/xpu/exllamav3_ext) stands in for the CUDA extension
++    import exllamav3_ext
++elif is_precompiled_extension_available():
+     import exllamav3_ext
+ else:
+ 
+diff --git i/exllamav3/generator/generator.py w/exllamav3/generator/generator.py
+index af3d1ad3..e4704b92 100644
+--- i/exllamav3/generator/generator.py
++++ w/exllamav3/generator/generator.py
+@@ -28,6 +28,12 @@ _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
+ _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
+ 
+ 
++# Lenient draft acceptance (b70 DSV4.1 port): accept a drafted token when the target gives it at least LENIENT_TAU times
++# the probability of its own pick (logit gap >= ln tau); the drafted token is emitted. 1.0 = exact (default).
++import math as _math
++LENIENT_TAU = [float(_os.environ.get("EXL3_LENIENT_TAU", "1.0"))]
++
++
+ def _dflash_layout(tensor: torch.Tensor, sample_from_anchor: bool) -> torch.Tensor:
+     """Align sampled IDs or confidence columns with verifier draft positions."""
+     return tensor if sample_from_anchor else tensor[:, 1:]
+@@ -1475,7 +1481,7 @@ class Generator:
+                 token_logits = batch_logits[a:b, :, :]
+                 sampled = job.receive_logits(token_logits)
+                 next_token = sampled[0]
+-                if next_token.is_cuda and next_token.numel() == 1:
++                if next_token.device.type != "cpu" and next_token.numel() == 1:
+                     k = len(launched)
+                     pinned[k:k + 1].copy_(next_token.view(1, 1), non_blocking = True)
+                     sampled = (pinned[k:k + 1],) + sampled[1:]
+@@ -1544,6 +1550,14 @@ class Generator:
+                     ).view(q_)
+                     d_ = draft_tokens[j, :q_ - 1].to(all_tokens.device, non_blocking = True)
+                     match_ = (all_tokens[:q_ - 1] == d_)
++                    if LENIENT_TAU[0] < 1.0:
++                        lg_ = job_logits.view(q_, -1)[:q_ - 1].float()
++                        gap_ = lg_.gather(1, d_.view(-1, 1).long()).view(-1) - \
++                            lg_.gather(1, all_tokens[:q_ - 1].view(-1, 1).long()).view(-1)
++                        len_ = gap_ >= _math.log(LENIENT_TAU[0])
++                        all_tokens = all_tokens.clone()
++                        all_tokens[:q_ - 1] = torch.where(len_, d_.to(all_tokens.dtype), all_tokens[:q_ - 1])
++                        match_ = match_ | len_
+                     packed_ = torch.cat([all_tokens, match_.to(all_tokens.dtype)]).cpu()   # single sync
+                     pre_tokens = packed_[:q_]
+                     pre_match = packed_[q_:].tolist()
+@@ -1557,6 +1571,14 @@ class Generator:
+                         next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+                             token_logits,
+                         )
++                        if (LENIENT_TAU[0] < 1.0 and draft_tokens is not None and i < batch_logits.shape[1] - 1
++                                and next_k_tokens is None):
++                            d_i = int(draft_tokens[j, i])
++                            t_i = int(next_token.view(-1)[0])
++                            if d_i != t_i:
++                                lgv = token_logits.view(-1)
++                                if float(lgv[d_i] - lgv[t_i]) >= _math.log(LENIENT_TAU[0]):
++                                    next_token = torch.full_like(next_token, d_i)
+                     eos, sampled_token, rq = job.receive_sample(
+                         token_logits,
+                         next_token,
+diff --git i/exllamav3/modules/attention_fn/dsa_triton.py w/exllamav3/modules/attention_fn/dsa_triton.py
+index efc8ad91..12d622cc 100644
+--- i/exllamav3/modules/attention_fn/dsa_triton.py
++++ w/exllamav3/modules/attention_fn/dsa_triton.py
+@@ -1013,6 +1013,13 @@ def dsa_attn(
+         # halve the head tile (perf is irrelevant with asserts on)
+         num_stages = min(num_stages, 2)
+         block_h = min(block_h, 16)
++    if q.device.type == "xpu":
++        # b70: Intel Xe2's register file / SLM do not take the (32 x 512) fp32 accumulator with 3 stages: the launch
++        # fails with UR_RESULT_ERROR_OUT_OF_RESOURCES (fatal, not a Triton OutOfResources)
++        # prompt-sized calls: 32-head tiles, one stage (3x faster than 16/2 on 4K-token chunks); decode keeps 16/2
++        big = q.shape[0] > 64
++        num_stages = min(num_stages, int(os.environ.get("DSV_DSA_STAGES", "1" if big else "2")))
++        block_h = min(block_h, int(os.environ.get("DSV_DSA_BLOCK_H", "32" if big else "16")))
+     if dsa_debug_bounds:
+         pool_rows = pool_s.numel() // (D_c // 32) if qc is not None else pool_c.numel() // max(D_c, 1)
+         dbg_pages = -(-pool_rows // max(page_size, 1))
+diff --git i/exllamav3/modules/attention_fn/smem.py w/exllamav3/modules/attention_fn/smem.py
+index 35eff525..302a56a7 100644
+--- i/exllamav3/modules/attention_fn/smem.py
++++ w/exllamav3/modules/attention_fn/smem.py
+@@ -40,6 +40,10 @@ def smem_limit(device) -> int:
+     """Dynamic shared memory per block the device grants (the opt-in maximum), in bytes."""
+     idx = _dev_index(device)
+     lim = _limit.get(idx)
++    if lim is None and not torch.version.cuda and hasattr(torch, "xpu") and torch.xpu.is_available():
++        # b70: Intel Xe2 SLM; the kernels' fp32 accumulators also need registers, so stay conservative
++        lim = int(os.environ.get("EXL3_XPU_SMEM", str(64 * 1024)))
++        _limit[idx] = lim
+     if lim is None:
+         props = torch.cuda.get_device_properties(idx)
+         lim = getattr(props, "shared_memory_per_block_optin", 0)
+diff --git i/exllamav3/modules/dsv41.py w/exllamav3/modules/dsv41.py
+index 81cbb750..5ed4eb51 100644
+--- i/exllamav3/modules/dsv41.py
++++ w/exllamav3/modules/dsv41.py
+@@ -11,6 +11,8 @@ from ..util.rope import yarn_inv_freq
+ from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
+ from .attention_fn.dsa_triton import dsa_attn
+ from ..constants import PAGE_SIZE
++import os
++_IDX_ROWS = int(os.environ.get("EXL3_V41_IDX_ROWS", "256"))
+ 
+ """
+ DeepSeek-V4.1 attention for compress_ratio > 0 layers (reference: inference/model.py
+@@ -406,7 +408,9 @@ class DSV41Attention(DSV4Attention):
+         return kl.pool_idx[pages, slots]                                      # (ec, D_i) fp16
+ 
+     def _v41_indexer(self, x, params, q_res, keys, ec, pos0, seq, inst):
+-        """Indexer scoring and top-k. keys: (ec, D_i) fp16 from this or a source pool."""
++        """Indexer scoring and top-k. keys: (ec, D_i) fp16 from this or a source pool.
++        b70: query rows are scored, masked and selected in blocks of _IDX_ROWS (the full (seq, ec) score matrix of a
++        long prompt chunk is GBs); the candidate source hands consumers a block-level mask (seq, nb)."""
+         Hi, Di, m, rd = self.index_n_heads, self.index_head_dim, self.compress_rate, self.rope_head_dim
+         dev = x.device
+         q_idx = self.idx_wq_b.forward(q_res, params).view(1, seq, Hi, Di).contiguous()
+@@ -415,38 +419,45 @@ class DSV41Attention(DSV4Attention):
+         if self.ref_quant:
+             q_idx = fp4_qdq(q_idx, 32, scale_e4m3 = False)
+         wts = self.idx_weights.forward(x, params).float()[0] * (Di ** -0.5 * Hi ** -0.5)   # (seq, Hi)
+-        keys = keys.float()                                                                # (ec, Di)
+-        positions = torch.arange(pos0, pos0 + seq, device = dev)
+-        comp_lens = (positions + 1) // m
+-        scores = torch.empty((seq, ec), device = dev)
+-        step = 256
+-        for s0 in range(0, seq, step):
+-            qs = q_idx[s0:s0 + step].float()
+-            sc = torch.relu(torch.einsum("nhd,ed->nhe", qs, keys))
+-            scores[s0:s0 + step] = torch.einsum("nhe,nh->ne", sc, wts[s0:s0 + step])
+-        vis = torch.arange(ec, device = dev).unsqueeze(0) < comp_lens.unsqueeze(1)
+-        scores.masked_fill_(~vis, float("-inf"))
+-        if self.candidate_role == "source":
+-            params[("v41_cand", inst)] = self._candidate_mask(scores, comp_lens, ec)
+-        elif self.candidate_role == "consumer":
+-            cand = params.get(("v41_cand", inst))
+-            if cand is not None:
+-                scores.masked_fill_(~cand, float("-inf"))
++        keys_t = keys.half().t().contiguous()                                              # (Di, ec)
+         k = min(self.index_topk, ec)
+-        K_pad = -(-k // 32) * 32
+-        top = scores.topk(k, dim = -1, sorted = False)
+-        idx = top.indices
+-        idx = torch.where(top.values > float("-inf"), idx, torch.full_like(idx, ec))
+-        idx = idx.sort(dim = -1).values
+-        idx = torch.where(idx < ec, idx, torch.full_like(idx, -1))
++        # b70: K_pad is a compile-time constant of the DSA kernels; a fixed width (the full top-k) keeps one kernel
++        # variant instead of a JIT compile every 32 entries of context (k_len carries the real count)
++        K_pad = -(-self.index_topk // 32) * 32
+         indices = torch.full((seq, K_pad), -1, dtype = torch.int32, device = dev)
+-        indices[:, :k] = idx.to(torch.int32)
++        bs = self.candidate_block_size
++        nb = -(-ec // bs)
++        if self.candidate_role == "source":
++            cand_out = torch.zeros((seq, nb), dtype = torch.bool, device = dev)
++            params[("v41_cand", inst)] = cand_out
++        cand_in = params.get(("v41_cand", inst)) if self.candidate_role == "consumer" else None
++        ar = torch.arange(ec, device = dev)
++        RB = _IDX_ROWS
++        for r0 in range(0, seq, RB):
++            r1 = min(seq, r0 + RB)
++            qs = q_idx[r0:r1].half()                                                       # (rb, Hi, Di)
++            sc = torch.relu(torch.matmul(qs.reshape(-1, Di), keys_t).float().view(r1 - r0, Hi, ec))
++            scores = torch.einsum("nhe,nh->ne", sc, wts[r0:r1])
++            del sc
++            comp_lens = (torch.arange(pos0 + r0, pos0 + r1, device = dev) + 1) // m
++            scores.masked_fill_(ar.unsqueeze(0) >= comp_lens.unsqueeze(1), float("-inf"))
++            if self.candidate_role == "source":
++                cand_out[r0:r1] = self._candidate_blocks(scores, comp_lens, ec)
++            elif cand_in is not None:
++                keep = cand_in[r0:r1].repeat_interleave(bs, dim = 1)[:, :ec]
++                scores.masked_fill_(~keep, float("-inf"))
++            top = scores.topk(k, dim = -1, sorted = False)
++            idx = top.indices
++            idx = torch.where(top.values > float("-inf"), idx, torch.full_like(idx, ec))
++            idx = idx.sort(dim = -1).values
++            idx = torch.where(idx < ec, idx, torch.full_like(idx, -1))
++            indices[r0:r1, :k] = idx.to(torch.int32)
+         return indices, k
+ 
+-    def _candidate_mask(self, scores, comp_lens, ec):
+-        """Reference select_candidate_blocks: per query, block-max scores over blocks of
+-        candidate_block_size entries, the block holding the newest visible entry pinned,
+-        keep the top candidate_topk_blocks blocks."""
++    def _candidate_blocks(self, scores, comp_lens, ec):
++        """Reference select_candidate_blocks at block level: per query, block-max scores over blocks of
++        candidate_block_size entries, the block holding the newest visible entry pinned, keep the top
++        candidate_topk_blocks blocks -> (rows, nb) bool."""
+         bs = self.candidate_block_size
+         seq = scores.shape[0]
+         nb = -(-ec // bs)
+@@ -459,7 +470,7 @@ class DSV41Attention(DSV4Attention):
+         top = blk.topk(k, dim = -1)
+         keep = torch.zeros_like(blk, dtype = torch.bool)
+         keep.scatter_(1, top.indices, top.values > float("-inf"))
+-        return keep.repeat_interleave(bs, dim = 1)[:, :ec]
++        return keep
+ 
+     # ---- per-job forward -----------------------------------------------------------------
+ 
+diff --git i/exllamav3/util/misc.py w/exllamav3/util/misc.py
+index 6292a4b6..cbdf3d4f 100644
+--- i/exllamav3/util/misc.py
++++ w/exllamav3/util/misc.py
+@@ -37,8 +37,9 @@ def cuda_sync_active():
+     Calling torch.cuda.synchronize() will create a CUDA context on CUDA:0 even if that device is not being used.
+     This function synchronizes only devices actively used by Torch in the current process.
+     """
++    dtype = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() and not torch.version.cuda else "cuda"
+     for device_id in range(torch.cuda.device_count()):
+-        device = torch.device(f'cuda:{device_id}')
++        device = torch.device(f'{dtype}:{device_id}')
+         if torch.cuda.memory_allocated(device) > 0:
+             torch.cuda.synchronize(device)
+ 

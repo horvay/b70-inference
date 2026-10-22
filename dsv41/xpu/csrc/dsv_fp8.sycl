@@ -1,0 +1,105 @@
+// FP8 (e4m3, E8M0 scale per 32x32 block) GEMV for decode rows on the Arc Pro B70 (plain SYCL, sub-group per row).
+//
+// y[m, n] = sum_k x[g(n)][m, k] * w[n, k] * 2^(s[n/32, k/32] - 127), w [N, Kd] uint8 (checkpoint (out, in) order),
+// x fp16 [G][M][Kd] where group g(n) = n / rows_per_group (rows_per_group = N for an ordinary linear; DeepSeek's
+// grouped wo_a projection has 8 groups of 1024 rows, each reading its own input slice). y fp32 or fp16 [M, N].
+// One sub-group of 16 lanes per output row, 8 rows per work-group; each lane takes 16 bytes per step.
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+namespace dsvfp8 {
+
+static inline float e4m3_x256(uint32_t b) {
+    // fp16 with bits ((b & 0x7F) << 7) | ((b & 0x80) << 8) == e4m3 value / 256 (normal and subnormal)
+    uint16_t h = (uint16_t)(((b & 0x7Fu) << 7) | ((b & 0x80u) << 8));
+    return (float)sycl::bit_cast<sycl::half>(h);
+}
+
+template <int MR, typename TY>
+struct Gemv {
+    const sycl::half* x; const uint8_t* w; const uint8_t* s; TY* y;
+    int M, N, Kd, rpg; long xg_stride;
+    [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        int lane = sg.get_local_linear_id();
+        int row = it.get_group(0) * 8 + sg.get_group_linear_id();
+        if (row >= N) return;
+        const sycl::half* xr = x + (long)(row / rpg) * xg_stride;
+        const uint8_t* wr = w + (long)row * Kd;
+        const uint8_t* sr = s + (long)(row / 32) * (Kd / 32);
+        float acc[MR];
+#pragma unroll
+        for (int m = 0; m < MR; ++m) acc[m] = 0.f;
+        for (int k0 = lane * 16; k0 < Kd; k0 += 256) {
+            sycl::vec<uint32_t, 4> wv = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(wr + k0);
+            float sc = sycl::exp2((float)sr[k0 / 32] - 119.0f);        // 2^(s - 127) * 256
+            float wf[16];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                uint32_t u = wv[q];
+#pragma unroll
+                for (int b = 0; b < 4; ++b) wf[q * 4 + b] = e4m3_x256((u >> (8 * b)) & 0xFF) * sc;
+            }
+#pragma unroll
+            for (int m = 0; m < MR; ++m) {
+                if (m < M) {
+                    const sycl::vec<sycl::half, 8>* xp = reinterpret_cast<const sycl::vec<sycl::half, 8>*>(xr + (long)m * Kd + k0);
+                    sycl::vec<sycl::half, 8> a = xp[0], c = xp[1];
+                    float t = 0.f;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) t += wf[j] * (float)a[j] + wf[8 + j] * (float)c[j];
+                    acc[m] += t;
+                }
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MR; ++m) {
+            if (m < M) {
+                float v = sycl::reduce_over_group(sg, acc[m], sycl::plus<float>());
+                if (lane == 0) y[(long)m * N + row] = (TY)v;
+            }
+        }
+    }
+};
+
+template <int MR>
+static void launch(const at::Tensor& x, const at::Tensor& w, const at::Tensor& s, at::Tensor& y, int rpg, long xgs) {
+    auto& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+    int M = x.size(-2), N = w.size(0), Kd = w.size(1);
+    sycl::range<1> g(((N + 7) / 8) * 128), l(128);
+    const sycl::half* xp = reinterpret_cast<const sycl::half*>(x.data_ptr());
+    if (y.scalar_type() == at::kFloat) {
+        Gemv<MR, float> k{xp, w.data_ptr<uint8_t>(), s.data_ptr<uint8_t>(), y.data_ptr<float>(), M, N, Kd, rpg, xgs};
+        q.parallel_for(sycl::nd_range<1>(g, l), k);
+    } else {
+        Gemv<MR, sycl::half> k{xp, w.data_ptr<uint8_t>(), s.data_ptr<uint8_t>(),
+                               reinterpret_cast<sycl::half*>(y.data_ptr()), M, N, Kd, rpg, xgs};
+        q.parallel_for(sycl::nd_range<1>(g, l), k);
+    }
+}
+
+// x [G, M, Kd] fp16 contiguous (G = 1 for an ordinary linear), w [N, Kd] u8, s [N/32, Kd/32] u8, y [M, N] f32/f16.
+void fp8_gemv(at::Tensor x, at::Tensor w, at::Tensor s, at::Tensor y, int64_t rows_per_group) {
+    TORCH_CHECK(x.scalar_type() == at::kHalf && x.is_contiguous());
+    TORCH_CHECK(w.scalar_type() == at::kByte && w.is_contiguous() && s.is_contiguous());
+    TORCH_CHECK(w.size(1) % 256 == 0, "fp8_gemv: Kd must be a multiple of 256");
+    int M = x.size(-2);
+    long xgs = (long)M * w.size(1);
+    int rpg = rows_per_group > 0 ? (int)rows_per_group : (int)w.size(0);
+    if (M == 1) launch<1>(x, w, s, y, rpg, xgs);
+    else if (M == 2) launch<2>(x, w, s, y, rpg, xgs);
+    else if (M <= 4) launch<4>(x, w, s, y, rpg, xgs);
+    else if (M <= 8) launch<8>(x, w, s, y, rpg, xgs);
+    else TORCH_CHECK(false, "fp8_gemv: M <= 8");
+}
+
+}  // namespace dsvfp8
+
+TORCH_LIBRARY(dsv_fp8, m) {
+    m.def("fp8_gemv(Tensor x, Tensor w, Tensor s, Tensor(a!) y, int rows_per_group) -> ()");
+}
+TORCH_LIBRARY_IMPL(dsv_fp8, XPU, m) {
+    m.impl("fp8_gemv", &dsvfp8::fp8_gemv);
+}

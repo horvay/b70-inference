@@ -2,3 +2,7 @@
 	path = glm/exllamav3
 	url = https://github.com/horvay/exllamav3.git
 	branch = b70-xpu
+[submodule "dsv41/exllamav3"]
+	path = dsv41/exllamav3
+	url = https://github.com/vcruz305/exllamav3
+	branch = master

@@ -1,0 +1,284 @@
+// Mixed-K grouped EXL3 GEMV for DeepSeek-V4.1-Flash routed experts on the Arc Pro B70 (ESIMD).
+//
+// SAGE MixedK packs every routed-expert projection at its own K (1..4 bits), so one MoE layer's picks need several
+// K. An "item" is one (activation rows, weight) GEMV: item a reads xh[a] (Hadamard-domain fp16 activations, blocked
+// [k/16][M][16]) and the trellis at address wptr[a] (device or host USM: VRAM- and RAM-resident experts look the
+// same), and writes fp32 split-K partials part[p][a][M][N]. One launch per K value; work-items of an item whose K
+// differs exit at once, so a fixed set of launches (graph-capturable) covers any mix of picks.
+// The inner loop is exl3_esimd.h's GemvKernel (trellis-serve), with the trellis base taken from the item table.
+
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include "exl3_esimd.h"
+
+using namespace exl3;
+
+namespace dsv {
+
+static sycl::queue& queue_of(const at::Tensor& t) {
+    return c10::xpu::getCurrentXPUStream(t.device().index()).queue();
+}
+
+template <int K, int MR, int NT>
+struct MoeGemv {
+    const fp16* xh;          // [items, k/16, M, 16]
+    const int64_t* wptr;     // [items] trellis addresses ([k/16][n/16][8K] uint32)
+    const int* kk;           // [items] K of each item
+    const int* n_items;      // [1] items in use (device)
+    float* part;             // [P, items, M, N]
+    int M, Kdim, N, tiles_n, rows_per_split, n_strips, P, items;
+
+    static constexpr int G = Geo<K>::G;
+    static constexpr int V = Geo<K>::V;
+    static constexpr int W = Geo<K>::WORDS;
+    static constexpr int D = Geo<K>::D;
+    static constexpr bool PLANAR = D > 1;
+    static constexpr int TP = G >= 32 ? 1 : 32 / G;
+    static constexpr int GV = G * TP;
+    static constexpr int NP = NT / TP;
+    static_assert(NT % TP == 0, "NT must be a multiple of the tile pairing");
+    static constexpr int ACC = MR * NP * 2 * GV;
+
+    template <int u>
+    static ESIMD_INLINE void step(simd<uint32_t, NT * W>& words, simd<uint32_t, NT * W>& prev,
+                                  simd<fp16, MR * 16>& xr, simd<fp16, ACC>& hacc) {
+        if constexpr (u < V) {
+            constexpr int h = (u >> 2) & 1;
+            constexpr int P_ = V == 8 ? 4 : (V == 16 ? 2 : 1);
+            constexpr int STR = V == 8 ? 2 : (V == 16 ? 4 : 1);
+            constexpr int R0 = 8 * ((u >> 1) & 1) + 2 * ((u >> 3) & 3) + (u & 1);
+#pragma unroll
+            for (int jp = 0; jp < NP; ++jp) {
+                simd<uint32_t, W * TP> dw = words.template select<W * TP, 1>(jp * W * TP);
+                simd<uint32_t, W * TP> pw = prev.template select<W * TP, 1>(jp * W * TP);
+                simd<fp16, GV> v = decode_cb_h<2, GV>(tile_states<K, u, TP, PLANAR>(dw, pw));
+#pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    auto a = hacc.template select<GV, 1>(((m * NP + jp) * 2 + h) * GV);
+                    a += v * xr.template replicate_vs_w_hs<GV / P_, 0, P_, STR>(m * 16 + R0);
+                }
+            }
+            step<u + 1>(words, prev, xr, hacc);
+        }
+    }
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        int id = it.get_global_id(0);
+        int strip = id % n_strips;
+        int rest = id / n_strips;
+        int p = rest % P;
+        int a = rest / P;
+        if (a >= items || a >= n_items[0]) return;
+        if (kk[a] != K) return;
+        if (p * rows_per_split >= Kdim / 16) return;
+        const uint32_t* tr = reinterpret_cast<const uint32_t*>(wptr[a]);
+        // a null weight address (a piece that is not resident: only after a pager failure) contributes zeros instead
+        // of faulting the GPU (a B70 page fault can wedge the xe driver)
+        int tile_n0 = strip * NT;
+        int r0 = p * rows_per_split;
+        int r1 = r0 + rows_per_split;
+        if (r1 > Kdim / 16) r1 = Kdim / 16;
+        if (!tr) r1 = r0;
+        const fp16* xbase = xh + (size_t)a * Kdim * M;
+
+        simd<float, ACC> acc = 0.0f;
+        for (int r = r0; r < r1; ++r) {
+            size_t t0 = (size_t)r * tiles_n + tile_n0;
+            simd<uint32_t, NT * W> words, prev;
+            load_words<NT, W>(tr + t0 * W, true, words, prev);
+            if constexpr (PLANAR) { planarize<NP, D, GV>(words); planarize<NP, D, GV>(prev); }
+            simd<fp16, MR * 16> xr = 0;
+            if (M == MR) {
+                xr = block_load<fp16, MR * 16>(xbase + (size_t)r * M * 16);
+            } else {
+#pragma unroll
+                for (int m = 0; m < MR; ++m)
+                    if (m < M)
+                        xr.template select<16, 1>(m * 16) = block_load<fp16, 16>(xbase + ((size_t)r * M + m) * 16);
+            }
+            simd<fp16, ACC> hacc = 0;
+            step<0>(words, prev, xr, hacc);
+            acc += convert<float>(hacc);
+        }
+
+        constexpr int L = 32 / V;
+        float* pbase = part + ((size_t)p * items + a) * M * N;
+#pragma unroll
+        for (int m = 0; m < MR; ++m) {
+            if (m >= M) break;
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                simd<float, 16> o;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    int base = ((m * NP + j / TP) * 2 + h) * GV + (j % TP) * G;
+                    simd<float, 8> s = acc.template select<8, L>(base);
+#pragma unroll
+                    for (int l = 1; l < L; ++l) s += acc.template select<8, L>(base + l);
+                    o.template select<8, 1>(h * 8) = s;
+                }
+                block_store<float, 16>(pbase + (size_t)m * N + (tile_n0 + j) * 16, o);
+            }
+        }
+    }
+};
+
+template <int K, int MR, int NT>
+static void launch(const at::Tensor& xh, const at::Tensor& wptr, const at::Tensor& kk, const at::Tensor& n_items,
+                   at::Tensor& part, int M, int Kdim, int N, int P, int rps, sycl::queue& q) {
+    int items = wptr.size(0);
+    int n_strips = (N / 16) / NT;
+    MoeGemv<K, MR, NT> k{reinterpret_cast<const fp16*>(xh.data_ptr()),
+                         reinterpret_cast<const int64_t*>(wptr.data_ptr()), kk.data_ptr<int>(),
+                         n_items.data_ptr<int>(), part.data_ptr<float>(), M, Kdim, N, N / 16, rps, n_strips, P,
+                         items};
+    int n = n_strips * P * items;
+    int local = 8;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((n + local - 1) / local * local, local), k); });
+}
+
+constexpr int tp_of(int K) { return (256 / (32 / cgcd(K, 32))) >= 32 ? 1 : 32 / (256 / (32 / cgcd(K, 32))); }
+constexpr int nt_raw(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
+constexpr int nt_of(int K, int MR) { return nt_raw(K, MR) < tp_of(K) ? tp_of(K) : nt_raw(K, MR); }
+
+template <int K>
+static void dispatch_mr(int MR, const at::Tensor& xh, const at::Tensor& wptr, const at::Tensor& kk,
+                        const at::Tensor& n_items, at::Tensor& part, int M, int Kdim, int N, int P, int rps,
+                        sycl::queue& q) {
+    switch (MR) {
+        case 1: launch<K, 1, nt_of(K, 1)>(xh, wptr, kk, n_items, part, M, Kdim, N, P, rps, q); return;
+        case 2: launch<K, 2, nt_of(K, 2)>(xh, wptr, kk, n_items, part, M, Kdim, N, P, rps, q); return;
+        case 4: launch<K, 4, nt_of(K, 4)>(xh, wptr, kk, n_items, part, M, Kdim, N, P, rps, q); return;
+    }
+    TORCH_CHECK(false, "moe_gemv: M <= 4 only");
+}
+
+// part [P, items, M, N] fp32 (P = split-K count) <- items' GEMVs; Ks: bit mask of K values to launch (bit K).
+void moe_gemv(at::Tensor xh, at::Tensor wptr, at::Tensor kk, at::Tensor n_items, at::Tensor part, int64_t Ks) {
+    TORCH_CHECK(xh.scalar_type() == at::kHalf && xh.is_contiguous() && xh.dim() == 3);
+    TORCH_CHECK(part.scalar_type() == at::kFloat && part.is_contiguous() && part.dim() == 4);
+    auto& q = queue_of(xh);
+    int M = xh.size(1), Kdim = xh.size(2), N = part.size(3), P = part.size(0);
+    int tk = Kdim / 16;
+    int rps = (tk + P - 1) / P;
+    int MR = M <= 1 ? 1 : (M <= 2 ? 2 : 4);
+    if (Ks & 2) dispatch_mr<1>(MR, xh, wptr, kk, n_items, part, M, Kdim, N, P, rps, q);
+    if (Ks & 4) dispatch_mr<2>(MR, xh, wptr, kk, n_items, part, M, Kdim, N, P, rps, q);
+    if (Ks & 8) dispatch_mr<3>(MR, xh, wptr, kk, n_items, part, M, Kdim, N, P, rps, q);
+    if (Ks & 16) dispatch_mr<4>(MR, xh, wptr, kk, n_items, part, M, Kdim, N, P, rps, q);
+}
+
+// Spin until a host-written flag (pinned memory) reaches step, polling with loads that bypass L1 and L3 (a cached copy
+// of host memory is never invalidated by host writes over PCIe). err / waits: pinned slots (own 512-byte lines).
+struct SpinDone {
+    const uint32_t* done; uint32_t* err; uint32_t* waits; const int64_t* step_p; int64_t max_it;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        constexpr auto props = properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::uncached>};
+        simd<int64_t, 1> sv = block_load<int64_t, 1>(step_p);       // device memory, written by a copy before
+        int64_t step = sv[0];
+        int64_t i = 0;
+        bool timed_out = false;
+        // An uncached plain load (L1 and L3 bypassed) with a fence in every iteration (without it the load was hoisted
+        // out of the loop). Not an atomic: GPU atomics on pinned host memory faulted twice ("not present", access
+        // type atomic). SYCL atomic loads missed the host's write in ~half the handoffs (tests/t_spin.py).
+        while (true) {
+            fence<memory_kind::global, fence_flush_op::invalidate, fence_scope::system>();
+            simd<uint32_t, 2> v = block_load<uint32_t, 2>(done, props);
+            if ((int64_t)(uint32_t)v[0] >= step) break;
+            if (++i > max_it) { timed_out = true; break; }
+        }
+        if (timed_out) {
+            simd<uint32_t, 2> e;
+            e[0] = (uint32_t)step; e[1] = (uint32_t)(step >> 32);
+            block_store<uint32_t, 2>(err, e, props);
+        }
+        simd<uint32_t, 2> w;
+        w[0] = (uint32_t)i; w[1] = (uint32_t)(i >> 32);
+        block_store<uint32_t, 2>(waits, w, props);
+        fence<memory_kind::global, fence_flush_op::none, fence_scope::system>();
+    }
+};
+
+// Polling-method test kernel: method 0 SYCL atomic load (system scope), 1 ESIMD block load uncached, 2 ESIMD atomic
+// load (lsc atomic, uncached), 3 volatile load. Records polls in waits[0], 1 in err on timeout.
+struct SpinTest {
+    int64_t* done; int64_t* err; int64_t* waits; int64_t step; int64_t max_it; int method;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        constexpr auto props = properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::uncached>};
+        int64_t i = 0;
+        bool to = false;
+        while (true) {
+            int64_t val;
+            if (method == 1) {
+                simd<uint32_t, 2> v = block_load<uint32_t, 2>(reinterpret_cast<const uint32_t*>(done), props);
+                val = (int64_t)(uint32_t)v[0] | ((int64_t)(uint32_t)v[1] << 32);
+            } else if (method == 2) {
+                simd<uint32_t, 1> off = 0;
+                simd<uint32_t, 1> v = atomic_update<atomic_op::load, uint32_t, 1>(reinterpret_cast<uint32_t*>(done), off,
+                                                                                   simd_mask<1>(1), props);
+                val = (int64_t)(uint32_t)v[0];
+            } else {
+                val = *reinterpret_cast<volatile int64_t*>(done);
+            }
+            if (val >= step) break;
+            if (++i > max_it) { to = true; break; }
+        }
+        simd<uint32_t, 2> w;
+        w[0] = (uint32_t)i; w[1] = (uint32_t)(to ? 1u : 0u);
+        block_store<uint32_t, 2>(reinterpret_cast<uint32_t*>(waits), w, props);
+    }
+};
+
+void spin_test(at::Tensor flags, int64_t done_i, at::Tensor waits, int64_t step, int64_t max_it, int64_t method,
+               at::Tensor dev) {
+    int64_t* f = flags.data_ptr<int64_t>();
+    SpinTest k{f + done_i, nullptr, waits.data_ptr<int64_t>(), step, max_it, (int)method};
+    queue_of(dev).submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(1, 1), k); });
+}
+
+// flags[idx] = value (pinned host memory), stream-ordered after the work before it on this stream (staging copies on
+// the copy stream). A plain uncached store, not an atomic: a GPU atomic on host memory faulted once ("not present",
+// access type atomic) and nothing here needs one.
+struct HostFlag {
+    uint32_t* p; int64_t v;
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        constexpr auto props = properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::uncached>};
+        simd<uint32_t, 2> w;
+        w[0] = (uint32_t)v; w[1] = (uint32_t)(v >> 32);
+        fence<memory_kind::global, fence_flush_op::none, fence_scope::system>();
+        block_store<uint32_t, 2>(p, w, props);
+        fence<memory_kind::global, fence_flush_op::none, fence_scope::system>();
+    }
+};
+
+void set_host_flag(at::Tensor flags, int64_t idx, int64_t value, at::Tensor dev) {
+    TORCH_CHECK(flags.scalar_type() == at::kLong && idx >= 0 && idx < flags.numel());
+    HostFlag k{reinterpret_cast<uint32_t*>(flags.data_ptr<int64_t>() + idx), value};
+    queue_of(dev).submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(1, 1), k); });
+}
+
+// dev: any XPU tensor (selects the device / stream; flags and waits are pinned host tensors)
+void spin_done_d(at::Tensor flags, int64_t done_i, int64_t err_i, at::Tensor waits, at::Tensor step, int64_t max_it,
+                 at::Tensor dev) {
+    TORCH_CHECK(flags.scalar_type() == at::kLong && waits.scalar_type() == at::kLong);
+    int64_t* f = flags.data_ptr<int64_t>();
+    SpinDone k{reinterpret_cast<const uint32_t*>(f + done_i), reinterpret_cast<uint32_t*>(f + err_i),
+               reinterpret_cast<uint32_t*>(waits.data_ptr<int64_t>()), step.data_ptr<int64_t>(), max_it};
+    queue_of(dev).submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(1, 1), k); });
+}
+
+}  // namespace dsv
+
+TORCH_LIBRARY(dsv_moe, m) {
+    m.def("moe_gemv(Tensor xh, Tensor wptr, Tensor kk, Tensor n_items, Tensor(a!) part, int Ks) -> ()");
+    m.def("spin_test(Tensor flags, int done_i, Tensor(a!) waits, int step, int max_it, int method, Tensor dev) -> ()");
+    m.def("set_host_flag(Tensor(a!) flags, int idx, int value, Tensor dev) -> ()");
+    m.def("spin_done(Tensor flags, int done_i, int err_i, Tensor(a!) waits, Tensor step, int max_it, Tensor dev) -> ()");
+}
+TORCH_LIBRARY_IMPL(dsv_moe, XPU, m) {
+    m.impl("moe_gemv", &dsv::moe_gemv);
+    m.impl("spin_done", &dsv::spin_done_d);
+    m.impl("set_host_flag", &dsv::set_host_flag);
+    m.impl("spin_test", &dsv::spin_test);
+}
